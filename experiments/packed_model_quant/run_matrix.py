@@ -8,6 +8,8 @@ import subprocess
 import sys
 from pathlib import Path
 
+from .detailed_report import write_detailed_report
+
 MATRIX = {
     "packed_rtn_w8_fp32": ("rtn_w8_all_linear", "dequant_fp32"),
     "packed_rtn_w8_a16": ("rtn_w8_all_linear", "a16_round_fp32_accum"),
@@ -84,16 +86,20 @@ def _aggregate(output, rows):
         writer.writeheader()
         writer.writerows(rows)
     temporary.replace(output / "summary.csv")
-    lines = [
-        "# Packed Qwen2.5-VL 六配置端到端实验", "",
-        "FP32配置隔离packed格式/FP16 scale误差；A16配置进一步加入Linear边界FP16舍入。所有CPU耗时仅表示当前解包实现，不代表真实INT4 kernel性能。", "",
-        "| 配置 | Final Hidden NMSE↓ | Cosine↑ | Logits KL↓ | Top-1↑ | 生成参考一致率↑ | Token一致率↑ | ΔNMSE vs fake | ΔKL vs fake |",
-        "|---|---:|---:|---:|---:|---:|---:|---:|---:|",
-    ]
-    for row in rows:
-        lines.append(f"| {row['name']} | {row['final_hidden_nmse']:.6g} | {row['final_hidden_cosine']:.6f} | {row['logits_kl']:.6g} | {row['top1_agreement']:.2%} | {row['generation_reference_agreement']:.2%} | {row['generation_token_agreement']:.2%} | {_delta(row['delta_nmse_vs_fake'])} | {_delta(row['delta_kl_vs_fake'])} |")
-    (output / "report.md.tmp").write_text("\n".join(lines) + "\n", encoding="utf-8")
-    (output / "report.md.tmp").replace(output / "report.md")
+    if set(MATRIX).issubset({row["name"] for row in rows}):
+        write_detailed_report(output, rows)
+    else:
+        lines = [
+            "# Packed Qwen2.5-VL 矩阵运行进度", "",
+            f"已完成 {len(rows)}/{len(MATRIX)} 个配置。六组齐全后将自动生成详细方法与结果报告。", "",
+            "| 配置 | Final Hidden NMSE↓ | Cosine↑ | Logits KL↓ | Top-1↑ |",
+            "|---|---:|---:|---:|---:|",
+        ]
+        for row in rows:
+            lines.append(f"| {row['name']} | {row['final_hidden_nmse']:.6g} | {row['final_hidden_cosine']:.6f} | {row['logits_kl']:.6g} | {row['top1_agreement']:.2%} |")
+        report = output / "report.md.tmp"
+        report.write_text("\n".join(lines) + "\n", encoding="utf-8")
+        report.replace(output / "report.md")
     (output / "metrics.json.tmp").write_text(json.dumps({row["name"]: row for row in rows}, indent=2) + "\n")
     (output / "metrics.json.tmp").replace(output / "metrics.json")
 

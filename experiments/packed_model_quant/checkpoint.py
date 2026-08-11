@@ -8,7 +8,7 @@ import json
 import math
 import shutil
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
 
 import torch
 import torch.nn as nn
@@ -281,8 +281,18 @@ def _assign_alias(model: nn.Module, alias: str, canonical: str) -> None:
         parent._buffers[leaf] = value
 
 
+LinearFactory = Callable[
+    [dict[str, Any], torch.Tensor, torch.Tensor, torch.Tensor | None],
+    PackedWeightOnlyLinear,
+]
+
+
 def _replace_from_inventory(
-    model: nn.Module, inventory: dict[str, Any], *, compute_mode: str
+    model: nn.Module,
+    inventory: dict[str, Any],
+    *,
+    compute_mode: str,
+    linear_factory: LinearFactory | None = None,
 ) -> list[str]:
     targets, _ffns = discover_full_model(model, strict_qwen3b=True)
     discovered = {target.name: target for target in targets}
@@ -298,17 +308,31 @@ def _replace_from_inventory(
         qweight = torch.empty(qshape, dtype=qdtype, device="meta")
         scales = torch.empty(tuple(row["scale_shape"]), dtype=sdtype, device="meta")
         bias = target.module.bias
-        replacement = PackedWeightOnlyLinear(
-            row["shape"][1], row["shape"][0], bits=row["bits"], group_size=row["group_size"],
-            qweight=qweight, scales=scales, bias=bias, compute_mode=compute_mode,
-        )
+        if linear_factory is None:
+            replacement = PackedWeightOnlyLinear(
+                row["shape"][1],
+                row["shape"][0],
+                bits=row["bits"],
+                group_size=row["group_size"],
+                qweight=qweight,
+                scales=scales,
+                bias=bias,
+                compute_mode=compute_mode,
+            )
+        else:
+            replacement = linear_factory(row, qweight, scales, bias)
+            if not isinstance(replacement, PackedWeightOnlyLinear):
+                raise TypeError("linear_factory must return PackedWeightOnlyLinear instances")
         _set_module(model, name, replacement)
         replaced.append(name)
     return replaced
 
 
 def load_packed_checkpoint(
-    checkpoint: Path, *, compute_mode: str = "dequant_fp32"
+    checkpoint: Path,
+    *,
+    compute_mode: str = "dequant_fp32",
+    linear_factory: LinearFactory | None = None,
 ) -> tuple[nn.Module, Any, dict[str, Any], dict[str, Any]]:
     if compute_mode not in COMPUTE_MODES:
         raise ValueError(f"unsupported compute mode {compute_mode!r}")
@@ -319,7 +343,12 @@ def load_packed_checkpoint(
     config = AutoConfig.from_pretrained(checkpoint)
     with init_empty_weights(include_buffers=False):
         model = Qwen2_5_VLForConditionalGeneration(config)
-        replaced = _replace_from_inventory(model, inventory, compute_mode=compute_mode)
+        replaced = _replace_from_inventory(
+            model,
+            inventory,
+            compute_mode=compute_mode,
+            linear_factory=linear_factory,
+        )
     index = json.loads((checkpoint / "model.safetensors.index.json").read_text(encoding="utf-8"))
     shard_names = sorted(set(index["weight_map"].values()))
     loaded: set[str] = set()
