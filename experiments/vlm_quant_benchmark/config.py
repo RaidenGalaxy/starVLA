@@ -9,16 +9,25 @@ from typing import Any
 
 
 class MethodName(StrEnum):
-    BF16_REFERENCE = "bf16_reference"
+    BF16_VALUE_FP32_COMPUTE = "bf16_value_fp32_compute"
+    # Compatibility alias. New configs serialize the unambiguous value above.
+    BF16_REFERENCE = "bf16_value_fp32_compute"
     RTN = "rtn"
     AWQ = "awq"
     GPTQ = "gptq"
     SMOOTHQUANT = "smoothquant"
     LLM_INT8 = "llm_int8"
+    VECTORWISE_W8 = "vectorwise_w8"
     TENDER = "tender"
     OMNIQUANT = "omniquant"
     SPQR = "spqr"
     SQUEEZELLM = "squeezellm"
+
+    @classmethod
+    def _missing_(cls, value):
+        if value == "bf16_reference":
+            return cls.BF16_VALUE_FP32_COMPUTE
+        return None
 
 
 class QuantScope(StrEnum):
@@ -26,11 +35,19 @@ class QuantScope(StrEnum):
     FULL_VLM_EXTENDED = "full_vlm_extended"
 
 
+class ImplementationTier(StrEnum):
+    REFERENCE = "reference"
+    NAIVE_BASELINE = "naive_baseline"
+    OFFICIAL_ANCHOR = "official_anchor"
+    LOCAL_VALIDATED = "local_algorithm_simulation"
+    CPU_RESEARCH = "cpu_research_approximation"
+
+
 @dataclasses.dataclass(frozen=True)
 class ExperimentConfig:
     method: MethodName
     scope: QuantScope = QuantScope.DECODER_CANONICAL
-    weight_bits: int = 4
+    weight_bits: int | None = 4
     activation_bits: int | None = None
     group_size: int = 128
     zero_point: bool = True
@@ -44,23 +61,67 @@ class ExperimentConfig:
     smoothquant_alpha: float = 0.5
     llm_int8_threshold: float = 6.0
     tender_groups: int = 4
-    format_version: int = 1
+    omniquant_steps: int = 20
+    squeezellm_kmeans_steps: int = 5
+    scheme_id: str = ""
+    implementation_tier: ImplementationTier | str = ImplementationTier.LOCAL_VALIDATED
+    calibration_protocol: str = "c4_128x2048"
+    model_revision: str = "local"
+    processor_revision: str = "local"
+    calibration_manifest_sha256: str = ""
+    evaluation_manifest_sha256: str = ""
+    min_pixels: int = 256 * 28 * 28
+    max_pixels: int = 1280 * 28 * 28
+    judge_model: str = "gpt-4o-mini"
+    judge_temperature: float = 0.0
+    judge_nproc: int = 4
+    judge_retries: int = 3
+    format_version: int = 2
 
     def __post_init__(self) -> None:
-        if self.weight_bits not in (4, 8):
-            raise ValueError("weight_bits must be 4 or 8")
+        if self.weight_bits not in (None, 4, 8):
+            raise ValueError("weight_bits must be None, 4, or 8")
         if self.activation_bits not in (None, 4, 8):
             raise ValueError("activation_bits must be None, 4, or 8")
         if self.group_size <= 0:
             raise ValueError("group_size must be positive")
         if self.calibration_samples <= 0 or self.calibration_tokens <= 0:
             raise ValueError("calibration limits must be positive")
+        if self.omniquant_steps <= 0 or self.squeezellm_kmeans_steps <= 0:
+            raise ValueError("second-wave optimization steps must be positive")
+        if self.min_pixels <= 0 or self.max_pixels < self.min_pixels:
+            raise ValueError("pixel bounds must satisfy 0 < min_pixels <= max_pixels")
+        if self.judge_nproc <= 0 or self.judge_retries < 0:
+            raise ValueError("invalid judge concurrency/retry settings")
+        tier = ImplementationTier(self.implementation_tier)
+        object.__setattr__(self, "implementation_tier", tier)
+        if not self.scheme_id:
+            object.__setattr__(self, "scheme_id", self._default_scheme_id())
+
+    def _default_scheme_id(self) -> str:
+        if self.method == MethodName.BF16_VALUE_FP32_COMPUTE:
+            return "bf16_value_fp32_compute"
+        activations = self.activation_bits or 16
+        quantizer = "asym" if self.zero_point else "sym"
+        return f"w{self.weight_bits}a{activations}_g{self.group_size}_{quantizer}"
 
     def to_dict(self) -> dict[str, Any]:
         value = dataclasses.asdict(self)
         value["method"] = self.method.value
         value["scope"] = self.scope.value
+        value["implementation_tier"] = ImplementationTier(self.implementation_tier).value
         return value
+
+    @classmethod
+    def from_dict(cls, value: dict[str, Any]) -> "ExperimentConfig":
+        fields = {item.name for item in dataclasses.fields(cls)}
+        payload = {key: item for key, item in value.items() if key in fields}
+        payload["method"] = MethodName(payload["method"])
+        payload["scope"] = QuantScope(payload.get("scope", QuantScope.DECODER_CANONICAL))
+        for key in ("awq_alpha_grid", "awq_clip_grid"):
+            if key in payload:
+                payload[key] = tuple(payload[key])
+        return cls(**payload)
 
     @property
     def digest(self) -> str:
@@ -76,19 +137,31 @@ class ExperimentConfig:
 
 def default_matrix() -> list[ExperimentConfig]:
     """Return method-matched configurations; unlike schemes are not conflated."""
-    configs = [ExperimentConfig(MethodName.BF16_REFERENCE)]
+    configs = [ExperimentConfig(
+        MethodName.BF16_VALUE_FP32_COMPUTE,
+        weight_bits=None,
+        zero_point=False,
+        implementation_tier=ImplementationTier.REFERENCE,
+    )]
     for scope in QuantScope:
         configs.extend(
             [
-                ExperimentConfig(MethodName.RTN, scope=scope),
+                ExperimentConfig(
+                    MethodName.RTN, scope=scope,
+                    implementation_tier=ImplementationTier.NAIVE_BASELINE,
+                ),
                 ExperimentConfig(MethodName.AWQ, scope=scope),
                 ExperimentConfig(MethodName.GPTQ, scope=scope),
-                ExperimentConfig(MethodName.RTN, scope=scope, weight_bits=8, activation_bits=8),
+                ExperimentConfig(
+                    MethodName.RTN, scope=scope, weight_bits=8, activation_bits=8,
+                    zero_point=False,
+                    implementation_tier=ImplementationTier.NAIVE_BASELINE,
+                ),
                 ExperimentConfig(MethodName.SMOOTHQUANT, scope=scope, weight_bits=8, activation_bits=8),
                 ExperimentConfig(MethodName.LLM_INT8, scope=scope, weight_bits=8, activation_bits=8),
                 ExperimentConfig(MethodName.TENDER, scope=scope, weight_bits=8, activation_bits=8),
-                ExperimentConfig(MethodName.TENDER, scope=scope, weight_bits=4, activation_bits=4),
+                ExperimentConfig(MethodName.TENDER, scope=scope, weight_bits=4, activation_bits=4,
+                                 zero_point=False),
             ]
         )
     return configs
-

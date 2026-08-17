@@ -1,12 +1,19 @@
 import json
 
 import pytest
+import pandas as pd
 import torch
 from PIL import Image
 from torch import nn
 
-from experiments.vlm_quant_benchmark.data import assert_disjoint, load_manifest
-from experiments.vlm_quant_benchmark.second_wave_methods import SparseCorrectionLinear
+from experiments.vlm_quant_benchmark.calibration import ActivationStats
+from experiments.vlm_quant_benchmark.config import ExperimentConfig, MethodName
+from experiments.vlm_quant_benchmark.data import MultimodalSample, assert_disjoint, load_manifest, write_manifest
+from experiments.vlm_quant_benchmark.prepare_vlmeval_screen import (
+    _canonical_target,
+    _stratified_circular_indices,
+)
+from experiments.vlm_quant_benchmark.second_wave_methods import SparseCorrectionLinear, omniquant_linear
 
 
 def write_sample(root, name, identifier, split, color):
@@ -15,7 +22,7 @@ def write_sample(root, name, identifier, split, color):
     manifest = root / f"{name}.jsonl"
     manifest.write_text(json.dumps({
         "id": identifier, "dataset": "toy", "split": split,
-        "image": image.name, "prompt": "What color?", "target": "red",
+        "image": image.name, "prompt": f"What color is sample {name}?", "target": "red",
     }) + "\n")
     return manifest
 
@@ -30,6 +37,23 @@ def test_manifest_and_image_leakage(tmp_path):
         assert_disjoint(calibration, evaluation)
 
 
+def test_write_manifest_roundtrips_images_relative_to_manifest(tmp_path):
+    root = tmp_path / "prepared"
+    image = root / "images" / "sample.png"
+    image.parent.mkdir(parents=True)
+    Image.new("RGB", (8, 8), "red").save(image)
+    manifest = root / "samples.jsonl"
+    write_manifest(manifest, [MultimodalSample(
+        id="sample:0", dataset="toy", split="train", image=image,
+        prompt="What color?", target="red",
+    )])
+    raw = json.loads(manifest.read_text())
+    assert raw["image"] == "images/sample.png"
+    assert raw["images"] == ["images/sample.png"]
+    loaded = load_manifest(manifest)
+    assert loaded[0].image == image
+
+
 def test_sparse_correction_linear_matches_dense_weight():
     source = nn.Linear(4, 3, bias=True)
     dense = torch.zeros_like(source.weight)
@@ -39,3 +63,48 @@ def test_sparse_correction_linear_matches_dense_weight():
     wrapper = SparseCorrectionLinear(source, dense, indices, values)
     value = torch.randn(2, 5, 4)
     torch.testing.assert_close(source(value), wrapper(value), atol=1e-6, rtol=1e-6)
+
+
+def test_omniquant_accepts_inference_mode_calibration_tensors():
+    source = nn.Linear(4, 3, bias=False)
+    with torch.inference_mode():
+        reservoir = torch.randn(2, 4)
+        stats = ActivationStats(
+            abs_sum=reservoir.abs().sum(0),
+            abs_max=reservoir.abs().amax(0),
+            rows=2,
+            reservoir=reservoir,
+        )
+    config = ExperimentConfig(MethodName.OMNIQUANT, omniquant_steps=1)
+    wrapper, audit = omniquant_linear(source, stats, config)
+    assert audit["steps"] == 1
+    assert torch.isfinite(wrapper(torch.randn(2, 4))).all()
+
+
+def test_screen_sampler_keeps_exact_complete_circular_groups():
+    rows = []
+    for group in range(16):
+        for variant in range(4):
+            rows.append({
+                "index": group * 100 + variant,
+                "g_index": group,
+                "answer_type": "mcq",
+                "category": f"category-{group % 2}",
+            })
+    data = pd.DataFrame(rows)
+    selected = _stratified_circular_indices(data, 64, seed=42)
+    assert len(selected) == 64
+    selected_groups = set(data.iloc[selected]["g_index"])
+    for group in selected_groups:
+        assert sum(data.iloc[selected]["g_index"] == group) == 4
+
+
+def test_screen_target_uses_plain_first_docvqa_answer():
+    assert _canonical_target("DocVQA_VAL", "['$2,000', '2000']") == "$2,000"
+    assert _canonical_target("DocVQA_VAL", ["primary", "alternative"]) == "primary"
+
+
+def test_screen_target_does_not_parse_other_dataset_bracket_text():
+    assert _canonical_target("MathVista_MINI", "[1, 2]") == "[1, 2]"
+    malformed = "[not valid Python"
+    assert _canonical_target("DocVQA_VAL", malformed) == malformed

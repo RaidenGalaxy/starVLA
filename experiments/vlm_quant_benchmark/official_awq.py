@@ -1,0 +1,199 @@
+"""Pure-CPU loader for Qwen's official AutoAWQ GEMM checkpoint.
+
+The packed checkpoint is dequantized to FP32 for quality evaluation.  This is an
+official quality anchor, not an integer-kernel memory or latency benchmark.
+"""
+from __future__ import annotations
+
+import json
+from pathlib import Path
+
+import torch
+from torch import nn
+
+
+AWQ_ORDER = (0, 2, 4, 6, 1, 3, 5, 7)
+AWQ_REVERSE_ORDER = (0, 4, 1, 5, 2, 6, 3, 7)
+
+
+def unpack_awq_gemm(value: torch.Tensor, *, bits: int = 4) -> torch.Tensor:
+    if bits != 4:
+        raise ValueError("the Qwen official AWQ anchor is W4")
+    if value.dtype != torch.int32:
+        value = value.to(torch.int32)
+    shifts = torch.arange(0, 32, bits, dtype=torch.int32, device=value.device)
+    unpacked = torch.bitwise_right_shift(
+        value[:, :, None], shifts[None, None, :]
+    )
+    unpacked = torch.bitwise_and(unpacked, (1 << bits) - 1)
+    unpacked = unpacked.reshape(value.shape[0], -1)
+    order = torch.arange(unpacked.shape[1], device=value.device)
+    order = order.reshape(-1, 32 // bits)[:, list(AWQ_REVERSE_ORDER)].reshape(-1)
+    return unpacked[:, order]
+
+
+def pack_awq_gemm(value: torch.Tensor, *, bits: int = 4) -> torch.Tensor:
+    if bits != 4 or value.ndim != 2 or value.shape[1] % 8:
+        raise ValueError("AWQ W4 packing requires [rows, columns] with columns divisible by 8")
+    value = value.to(torch.int32)
+    if int(value.min()) < 0 or int(value.max()) > 15:
+        raise ValueError("AWQ W4 values must be in [0, 15]")
+    packed = torch.zeros(
+        (value.shape[0], value.shape[1] // 8),
+        dtype=torch.int32,
+        device=value.device,
+    )
+    for column in range(packed.shape[1]):
+        for shift_index, source_index in enumerate(AWQ_ORDER):
+            packed[:, column] |= value[:, column * 8 + source_index] << (shift_index * bits)
+    return packed
+
+
+def dequantize_awq_gemm(
+    qweight: torch.Tensor,
+    qzeros: torch.Tensor,
+    scales: torch.Tensor,
+    *,
+    group_size: int = 128,
+) -> torch.Tensor:
+    """Return an nn.Linear-shaped [out_features, in_features] FP32 weight."""
+    integer_weight = unpack_awq_gemm(qweight)
+    integer_zeros = unpack_awq_gemm(qzeros)
+    if scales.shape != integer_zeros.shape:
+        raise ValueError(
+            f"AWQ scale/zero shape mismatch: {tuple(scales.shape)} != {tuple(integer_zeros.shape)}"
+        )
+    if integer_weight.shape[0] != scales.shape[0] * group_size:
+        raise ValueError("AWQ qweight input dimension is inconsistent with group size")
+    repeated_scales = scales.float().repeat_interleave(group_size, dim=0)
+    repeated_zeros = integer_zeros.float().repeat_interleave(group_size, dim=0)
+    weight_input_output = (integer_weight.float() - repeated_zeros) * repeated_scales
+    return weight_input_output.T.contiguous()
+
+
+class SafeTensorStore:
+    def __init__(self, checkpoint: Path) -> None:
+        try:
+            from safetensors import safe_open
+        except ImportError as error:
+            raise ImportError("safetensors is required for the official AWQ anchor") from error
+        self.safe_open = safe_open
+        index = checkpoint / "model.safetensors.index.json"
+        single = checkpoint / "model.safetensors"
+        if index.is_file():
+            payload = json.loads(index.read_text())
+            self.weight_map = {
+                name: checkpoint / filename
+                for name, filename in payload["weight_map"].items()
+            }
+        elif single.is_file():
+            with safe_open(single, framework="pt", device="cpu") as handle:
+                self.weight_map = {name: single for name in handle.keys()}
+        else:
+            raise FileNotFoundError(f"no safetensors checkpoint under {checkpoint}")
+
+    def keys(self) -> list[str]:
+        return sorted(self.weight_map)
+
+    def get(self, name: str) -> torch.Tensor:
+        path = self.weight_map[name]
+        with self.safe_open(path, framework="pt", device="cpu") as handle:
+            return handle.get_tensor(name)
+
+
+def reference_model_name(checkpoint_name: str) -> str:
+    """Map official AutoAWQ names to Transformers 4.57 Qwen2.5-VL names."""
+    if checkpoint_name.startswith("model.layers."):
+        suffix = checkpoint_name.removeprefix("model.layers.")
+        return f"model.language_model.layers.{suffix}"
+    if checkpoint_name.startswith("model.embed_tokens."):
+        suffix = checkpoint_name.removeprefix("model.embed_tokens.")
+        return f"model.language_model.embed_tokens.{suffix}"
+    if checkpoint_name.startswith("model.norm."):
+        suffix = checkpoint_name.removeprefix("model.norm.")
+        return f"model.language_model.norm.{suffix}"
+    if checkpoint_name.startswith("visual."):
+        return "model." + checkpoint_name
+    return checkpoint_name
+
+
+def _module(model: nn.Module, name: str) -> nn.Module:
+    reference_name = reference_model_name(name)
+    try:
+        return model.get_submodule(reference_name)
+    except AttributeError as error:
+        raise KeyError(f"official AWQ module not found: {name} -> {reference_name}") from error
+
+
+@torch.inference_mode()
+def load_official_awq_dequantized(
+    model: nn.Module,
+    checkpoint: Path,
+    *,
+    group_size: int = 128,
+) -> dict:
+    store = SafeTensorStore(checkpoint)
+    packed_modules, dense_tensors, shapes = 0, 0, {}
+    for qweight_name in [name for name in store.keys() if name.endswith(".qweight")]:
+        module_name = qweight_name.removesuffix(".qweight")
+        module = _module(model, module_name)
+        if not isinstance(module, nn.Linear):
+            raise TypeError(f"official AWQ target is not nn.Linear: {module_name}")
+        qweight = store.get(qweight_name)
+        qzeros = store.get(f"{module_name}.qzeros")
+        scales = store.get(f"{module_name}.scales")
+        weight = dequantize_awq_gemm(
+            qweight, qzeros, scales, group_size=group_size,
+        )
+        if weight.shape != module.weight.shape:
+            raise ValueError(
+                f"official AWQ shape mismatch for {module_name}: "
+                f"{tuple(weight.shape)} != {tuple(module.weight.shape)}"
+            )
+        module.weight.copy_(weight.to(module.weight.dtype))
+        bias_name = f"{module_name}.bias"
+        if module.bias is not None and bias_name in store.weight_map:
+            module.bias.copy_(store.get(bias_name).to(module.bias.dtype))
+        packed_modules += 1
+        shapes[module_name] = {
+            "qweight": list(qweight.shape),
+            "qzeros": list(qzeros.shape),
+            "scales": list(scales.shape),
+            "weight": list(weight.shape),
+            "reference_module": reference_model_name(module_name),
+        }
+
+    packed_prefixes = {
+        name.removesuffix(".qweight")
+        for name in store.keys() if name.endswith(".qweight")
+    }
+    state = dict(model.named_parameters())
+    for name in store.keys():
+        if not (name.endswith(".weight") or name.endswith(".bias")):
+            continue
+        module_name = name.rsplit(".", 1)[0]
+        reference_name = reference_model_name(name)
+        if module_name in packed_prefixes or reference_name not in state:
+            continue
+        tensor = store.get(name)
+        if tensor.shape != state[reference_name].shape:
+            raise ValueError(
+                f"dense official tensor shape mismatch: {name} -> {reference_name}"
+            )
+        state[reference_name].copy_(tensor.to(state[reference_name].dtype))
+        dense_tensors += 1
+
+    if packed_modules == 0:
+        raise ValueError("official AWQ checkpoint contains no packed qweight tensors")
+    return {
+        "kind": "official_qwen_awq_cpu_dequantized_quality_anchor",
+        "packed_modules": packed_modules,
+        "dense_tensors_loaded": dense_tensors,
+        "bits": 4,
+        "group_size": group_size,
+        "zero_point": True,
+        "packing_order": list(AWQ_ORDER),
+        "quality_eval_storage": "fp32_dequantized",
+        "deployment_kernel_claim": False,
+        "modules": shapes,
+    }

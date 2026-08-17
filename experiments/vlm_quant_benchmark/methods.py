@@ -49,15 +49,18 @@ class ScaledQuantLinear(FrozenLinear):
 
 
 class W8A8Linear(FrozenLinear):
-    def __init__(self, source: nn.Linear, weight: torch.Tensor, input_scale: torch.Tensor | None = None) -> None:
+    def __init__(self, source: nn.Linear, weight: torch.Tensor,
+                 input_scale: torch.Tensor | None = None,
+                 activation_bits: int = 8) -> None:
         super().__init__(source, weight)
         self.register_buffer("input_scale", input_scale)
+        self.activation_bits = activation_bits
 
     def forward(self, value: torch.Tensor) -> torch.Tensor:
         value = value.float()
         if self.input_scale is not None:
             value = value / self.input_scale
-        value = dynamic_activation_qdq(value, 8, per_token=True)
+        value = dynamic_activation_qdq(value, self.activation_bits, per_token=True)
         return F.linear(value, self.weight, self.bias)
 
 
@@ -142,7 +145,8 @@ def _rtn(source: nn.Linear, config: ExperimentConfig) -> tuple[nn.Module, dict]:
     if config.activation_bits is None:
         wrapper = FrozenLinear(source, result.dequantized)
     else:
-        wrapper = W8A8Linear(source, result.dequantized)
+        wrapper = W8A8Linear(
+            source, result.dequantized, activation_bits=config.activation_bits or 8)
     return wrapper, dataclasses.asdict(result) | {"dequantized": None, "qvalues": None, "scales": None, "zero_points": None}
 
 
@@ -203,18 +207,40 @@ def _smoothquant(source: nn.Linear, stats: ActivationStats, config: ExperimentCo
         group_size=config.group_size,
         zero_point=False,
     )
-    return W8A8Linear(source, quantized.dequantized, scale), {
+    return W8A8Linear(source, quantized.dequantized, scale, activation_bits=8), {
         "alpha": alpha,
         "weight_mse": quantized.mse,
         "weight_nmse": quantized.nmse,
     }
 
 
+def _vectorwise_w8(source: nn.Linear, config: ExperimentConfig) -> tuple[nn.Module, dict]:
+    """Per-output-channel W8 plus per-token A8, without a dense outlier branch."""
+    quantized = quantize_weight_groupwise(
+        source.weight,
+        bits=8,
+        group_size=source.in_features,
+        zero_point=False,
+    )
+    return W8A8Linear(source, quantized.dequantized, activation_bits=8), {
+        "algorithm": "vectorwise_w8_baseline",
+        "weight_mse": quantized.mse,
+        "weight_nmse": quantized.nmse,
+        "logical_bits_per_weight": 8 + 16 / source.in_features,
+    }
+
+
 def _llm_int8(source: nn.Linear, config: ExperimentConfig) -> tuple[nn.Module, dict]:
-    quantized = quantize_weight_groupwise(source.weight, bits=8, group_size=config.group_size, zero_point=False)
+    quantized = quantize_weight_groupwise(
+        source.weight, bits=8, group_size=source.in_features, zero_point=False,
+    )
     return LLMInt8Linear(source, quantized.dequantized, config.llm_int8_threshold), {
+        "algorithm": "vectorwise_int8_with_dynamic_fp32_outlier_branch",
         "threshold": config.llm_int8_threshold,
         "weight_mse": quantized.mse,
+        "logical_bits_per_weight": 8 + 16 / source.in_features,
+        "quality_eval_storage": "int8_qdq_plus_full_fp32_reference",
+        "deployment_kernel_claim": False,
     }
 
 
@@ -237,39 +263,67 @@ def _tender(source: nn.Linear, stats: ActivationStats, config: ExperimentConfig)
 
 
 def _gptq_groupwise(source: nn.Linear, stats: ActivationStats, config: ExperimentConfig) -> tuple[nn.Module, dict]:
-    """CPU-bounded GPTQ with second-order error feedback inside each q-group."""
-    weight = source.weight.detach().float().clone()
+    """Blockwise sequential GPTQ with Hessian-guided error propagation."""
+    reference = source.weight.detach().float()
+    restored = torch.empty_like(reference)
     sample = stats.reservoir.float()
-    columns = weight.shape[1]
+    columns = reference.shape[1]
     damp = 0.01
+    fallback_blocks = 0
     for start in range(0, columns, config.group_size):
         stop = min(start + config.group_size, columns)
         x = sample[:, start:stop]
         hessian = (x.T @ x) / max(x.shape[0], 1)
+        block = reference[:, start:stop].clone()
+        dead = hessian.diag() == 0
+        hessian[dead, dead] = 1
+        block[:, dead] = 0
         diagonal_mean = hessian.diag().mean().clamp_min(1e-8)
         hessian.diagonal().add_(damp * diagonal_mean)
         try:
             inverse = torch.cholesky_inverse(torch.linalg.cholesky(hessian))
+            inverse_factor = torch.linalg.cholesky(inverse, upper=True)
         except RuntimeError:
+            fallback_blocks += 1
             inverse = torch.linalg.pinv(hessian)
-        block = weight[:, start:stop]
-        quantized = quantize_weight_groupwise(
+            inverse.diagonal().clamp_min_(1e-8)
+            inverse_factor = inverse
+
+        quantizer = quantize_weight_groupwise(
             block,
             bits=config.weight_bits,
             group_size=stop - start,
             zero_point=config.zero_point,
-        ).dequantized
-        error = block - quantized
-        # Approximate GPTQ's sequential compensation without a full KxK Hessian.
-        compensation = error @ (inverse / inverse.diag().clamp_min(1e-8).unsqueeze(0))
-        weight[:, start:stop] = quantized + 0.01 * compensation
-        weight[:, start:stop] = quantize_weight_groupwise(
-            weight[:, start:stop],
-            bits=config.weight_bits,
-            group_size=stop - start,
-            zero_point=config.zero_point,
-        ).dequantized
-    return FrozenLinear(source, weight), {"algorithm": "groupwise_second_order_error_feedback", "damp": damp}
+        )
+        scales = quantizer.scales[:, 0].clamp_min(1e-12)
+        zeros = None if quantizer.zero_points is None else quantizer.zero_points[:, 0]
+        qmin = 0 if config.zero_point else -(1 << (config.weight_bits - 1)) + 1
+        qmax = (1 << config.weight_bits) - 1 if config.zero_point else (1 << (config.weight_bits - 1)) - 1
+        quantized_block = torch.empty_like(block)
+        work = block.clone()
+        for column in range(stop - start):
+            value = work[:, column]
+            if zeros is None:
+                quantized = torch.round(value / scales).clamp(qmin, qmax) * scales
+            else:
+                quantized = (
+                    torch.round(value / scales + zeros).clamp(qmin, qmax) - zeros
+                ) * scales
+            quantized_block[:, column] = quantized
+            diagonal = inverse_factor[column, column].clamp_min(1e-8)
+            error = (value - quantized) / diagonal
+            if column + 1 < stop - start:
+                work[:, column + 1:] -= (
+                    error[:, None] * inverse_factor[column, column + 1:][None, :]
+                )
+        restored[:, start:stop] = quantized_block
+    return FrozenLinear(source, restored), {
+        "algorithm": "blockwise_sequential_gptq",
+        "block_size": config.group_size,
+        "damp_percent": damp,
+        "fallback_blocks": fallback_blocks,
+        "weight_nmse": normalized_mse(reference, restored),
+    }
 
 
 def apply_method(
@@ -310,6 +364,8 @@ def apply_method(
                 replacement, audit = _smoothquant(source, calibration[item.name], config)  # type: ignore[index]
             elif config.method == MethodName.LLM_INT8:
                 replacement, audit = _llm_int8(source, config)
+            elif config.method == MethodName.VECTORWISE_W8:
+                replacement, audit = _vectorwise_w8(source, config)
             elif config.method == MethodName.TENDER:
                 replacement, audit = _tender(source, calibration[item.name], config)  # type: ignore[index]
             else:
@@ -318,12 +374,22 @@ def apply_method(
             originals[item.name] = source
             setattr(parent, key, replacement)
             module_audit[item.name] = audit | {"subsystem": item.subsystem}
+            module_audit[item.name]["weight_count"] = source.weight.numel()
     except Exception:
         for name, original in originals.items():
             parent, key = _parent_and_key(model, name)
             setattr(parent, key, original)
         raise
 
+    scale_bits = 16
+    zero_bits = config.weight_bits if config.zero_point else 0
+    if config.method in {MethodName.VECTORWISE_W8, MethodName.LLM_INT8}:
+        logical_bpw = sum(
+            value["logical_bits_per_weight"] * value["weight_count"]
+            for value in module_audit.values()
+        ) / sum(value["weight_count"] for value in module_audit.values())
+    else:
+        logical_bpw = config.weight_bits + (scale_bits + zero_bits) / config.group_size
     return AppliedQuantization(
         model,
         originals,
@@ -332,6 +398,7 @@ def apply_method(
             "scope": config.scope.value,
             "module_count": len(originals),
             "elapsed_seconds": time.perf_counter() - started,
+            "logical_bits_per_weight": logical_bpw,
             "modules": module_audit,
         },
     )

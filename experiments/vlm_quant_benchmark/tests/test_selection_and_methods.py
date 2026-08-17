@@ -1,6 +1,7 @@
 import torch
 from torch import nn
 
+from experiments.vlm_quant_benchmark.calibration import ActivationCollector
 from experiments.vlm_quant_benchmark.config import ExperimentConfig, MethodName, QuantScope
 from experiments.vlm_quant_benchmark.methods import ScaledQuantLinear
 from experiments.vlm_quant_benchmark.safe_methods import apply_method
@@ -35,6 +36,19 @@ class ToyVLM(nn.Module):
         self.visual.merger = nn.Linear(8, 8)
         self.lm_head = nn.Linear(8, 32, bias=False)
         self.patch_embed = nn.Conv3d(3, 8, 2)
+
+
+def test_activation_collector_registers_callable_hook_and_removes_it():
+    model = ToyVLM()
+    selected = select_linears(model, QuantScope.DECODER_CANONICAL, strict_qwen_3b=False)
+    target = selected[0]
+    with ActivationCollector([target], reservoir_rows=2) as collector:
+        target.module(torch.arange(8, dtype=torch.float32).unsqueeze(0))
+        stats = collector.stats[target.name]
+        assert stats.rows == 1
+        assert stats.reservoir.shape == (1, 8)
+        assert torch.equal(stats.abs_max, torch.arange(8, dtype=torch.float32))
+    assert not target.module._forward_pre_hooks
 
 
 def test_selector_scopes_and_exclusions():

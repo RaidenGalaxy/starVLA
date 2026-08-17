@@ -80,6 +80,8 @@ class TokenNLL:
         if not valid.any():
             return
         loss = torch.nn.functional.cross_entropy(shifted_logits[valid], shifted_labels[valid], reduction="sum")
+        if not torch.isfinite(loss):
+            raise ValueError("token NLL is non-finite")
         self.total_nll += float(loss.item())
         self.tokens += int(valid.sum().item())
 

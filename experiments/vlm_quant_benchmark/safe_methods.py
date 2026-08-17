@@ -23,7 +23,8 @@ def _memory_safe_rtn(source: nn.Linear, config: ExperimentConfig):
     if config.activation_bits is None:
         wrapper = _implementation.FrozenLinear(source, result.dequantized)
     else:
-        wrapper = _implementation.W8A8Linear(source, result.dequantized)
+        wrapper = _implementation.W8A8Linear(
+            source, result.dequantized, activation_bits=config.activation_bits or 8)
     audit = {
         "bits": result.bits,
         "group_size": result.group_size,
