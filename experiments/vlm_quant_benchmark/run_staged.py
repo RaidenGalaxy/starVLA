@@ -28,8 +28,6 @@ SCHEMES = (
     ("tender", "tender_w8a8_g128_sym", 8, 8),
     ("vectorwise_w8", "vectorwise_w8_baseline", 8, 8),
     ("llm_int8", "llm_int8_vectorwise_mixed_w8", 8, 8),
-    ("rtn", "naive_w4a4_g128_sym", 4, 4),
-    ("tender", "tender_w4a4_g128_sym", 4, 4),
 )
 
 

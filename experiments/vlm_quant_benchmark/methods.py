@@ -135,10 +135,15 @@ class AppliedQuantization:
 
 
 def _rtn(source: nn.Linear, config: ExperimentConfig) -> tuple[nn.Module, dict]:
+    group_size = (
+        source.in_features
+        if config.weight_granularity == "per_output_channel"
+        else config.group_size
+    )
     result = quantize_weight_groupwise(
         source.weight,
         bits=config.weight_bits,
-        group_size=config.group_size,
+        group_size=group_size,
         zero_point=config.zero_point,
     )
     wrapper: nn.Module
@@ -203,11 +208,18 @@ def _smoothquant(source: nn.Linear, stats: ActivationStats, config: ExperimentCo
     scale = scale.clamp_min(1e-6)
     quantized = quantize_weight_groupwise(
         weight * scale.unsqueeze(0),
-        bits=8,
-        group_size=config.group_size,
+        bits=config.weight_bits,
+        group_size=(
+            source.in_features
+            if config.weight_granularity == "per_output_channel"
+            else config.group_size
+        ),
         zero_point=False,
     )
-    return W8A8Linear(source, quantized.dequantized, scale, activation_bits=8), {
+    return W8A8Linear(
+        source, quantized.dequantized, scale,
+        activation_bits=config.activation_bits or 8,
+    ), {
         "alpha": alpha,
         "weight_mse": quantized.mse,
         "weight_nmse": quantized.nmse,
@@ -389,7 +401,16 @@ def apply_method(
             for value in module_audit.values()
         ) / sum(value["weight_count"] for value in module_audit.values())
     else:
-        logical_bpw = config.weight_bits + (scale_bits + zero_bits) / config.group_size
+        if config.weight_granularity == "per_output_channel":
+            logical_bpw = sum(
+                (
+                    config.weight_bits
+                    + (scale_bits + zero_bits) / model.get_submodule(name).in_features
+                ) * value["weight_count"]
+                for name, value in module_audit.items()
+            ) / sum(value["weight_count"] for value in module_audit.values())
+        else:
+            logical_bpw = config.weight_bits + (scale_bits + zero_bits) / config.group_size
     return AppliedQuantization(
         model,
         originals,

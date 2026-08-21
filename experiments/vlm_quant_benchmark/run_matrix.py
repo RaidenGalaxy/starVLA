@@ -35,6 +35,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--max-new-tokens", type=int, default=128)
     parser.add_argument("--threads", type=int, default=16)
     parser.add_argument("--resume", action="store_true")
+    parser.add_argument("--dry-run", action="store_true")
     parser.add_argument("--allow-nonstandard-model", action="store_true")
     return parser.parse_args()
 
@@ -96,9 +97,20 @@ def method_configs(
                 method, weight_bits=8, activation_bits=8, zero_point=False,
                 scheme_id="naive_w8a8_g128_sym", **baseline,
             ),
+        ]
+    if method == MethodName.MBQ:
+        if scope != QuantScope.DECODER_CANONICAL:
+            raise ValueError("MBQ is available for decoder_canonical scope only")
+        return [
             ExperimentConfig(
-                method, weight_bits=4, activation_bits=4, zero_point=False,
-                scheme_id="naive_w4a4_g128_sym", **baseline,
+                method, weight_bits=4, activation_bits=None, zero_point=True,
+                weight_granularity="groupwise",
+                scheme_id="mbq_w4a16_g128_asym", **common,
+            ),
+            ExperimentConfig(
+                method, weight_bits=4, activation_bits=8, zero_point=False,
+                weight_granularity="per_output_channel",
+                scheme_id="mbq_w4a8_perchannel_sym", **common,
             ),
         ]
     if method == MethodName.TENDER:
@@ -106,10 +118,6 @@ def method_configs(
             ExperimentConfig(
                 method, weight_bits=8, activation_bits=8, zero_point=False,
                 scheme_id="tender_w8a8_g128_sym", **common,
-            ),
-            ExperimentConfig(
-                method, weight_bits=4, activation_bits=4, zero_point=False,
-                scheme_id="tender_w4a4_g128_sym", **common,
             ),
         ]
     if method == MethodName.SMOOTHQUANT:
@@ -210,6 +218,18 @@ def main() -> None:
                     command.append("--resume")
                 if args.allow_nonstandard_model:
                     command.append("--allow-nonstandard-model")
+                if args.dry_run:
+                    rows.append({
+                        "run_id": run_id,
+                        "method": method.value,
+                        "scheme_id": config.scheme_id,
+                        "scope": scope.value,
+                        "implementation_tier": str(config.implementation_tier),
+                        "status": "planned",
+                        "command": command,
+                    })
+                    write_summary(args.output_dir / "summary.csv", rows)
+                    continue
                 completed = subprocess.run(command, check=False)
                 if completed.returncode == 0:
                     metrics = json.loads((destination / "metrics.json").read_text())

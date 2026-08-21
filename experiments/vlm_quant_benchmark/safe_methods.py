@@ -14,10 +14,15 @@ from .quantization import quantize_weight_groupwise
 
 
 def _memory_safe_rtn(source: nn.Linear, config: ExperimentConfig):
+    group_size = (
+        source.in_features
+        if config.weight_granularity == "per_output_channel"
+        else config.group_size
+    )
     result = quantize_weight_groupwise(
         source.weight,
         bits=config.weight_bits,
-        group_size=config.group_size,
+        group_size=group_size,
         zero_point=config.zero_point,
     )
     if config.activation_bits is None:

@@ -19,12 +19,18 @@ from .calibration import (
 from .config import ExperimentConfig, MethodName
 from .data import MultimodalSample, sample_manifest_digest
 from .evaluation import evaluate_multimodal, processor_inputs
+from .mbq import (
+    collect_mbq_search_cached,
+    mbq_cache_key,
+    mbq_calibration_batches,
+)
 from .provenance import completed_run, mark_complete
 from .reporting import atomic_json, write_report
 from .selection import inventory, select_linears
 
 
 CALIBRATION_METHODS = {
+    MethodName.MBQ,
     MethodName.AWQ,
     MethodName.GPTQ,
     MethodName.SMOOTHQUANT,
@@ -164,29 +170,56 @@ def run_config(
         calibration_subset_digest = sample_manifest_digest(
             calibration_samples[:config.calibration_samples]
         )
-        cache_key = calibration_cache_key(
-            model_revision=input_digests["model"],
-            calibration_digest=calibration_subset_digest,
-            selected_names=[item.name for item in selected],
-            min_pixels=config.min_pixels,
-            max_pixels=config.max_pixels,
-            reservoir_rows=32,
-            seed=config.seed,
-        )
-        stats, cache_hit = collect_calibration_cached(
-            model,
-            selected,
-            calibration_batches(
-                processor,
-                calibration_samples[:config.calibration_samples],
+        cache_root = calibration_cache_dir or output_dir.parent / "_calibration_cache"
+        if config.method == MethodName.MBQ:
+            calibration_attention = "sdpa"
+            cache_key = mbq_cache_key(
+                model_revision=input_digests["model"],
+                calibration_digest=calibration_subset_digest,
+                selected_names=[item.name for item in selected],
+                config=config,
+                reservoir_rows=32,
+                attention_implementation=calibration_attention,
+            )
+            stats, cache_hit = collect_mbq_search_cached(
+                model,
+                selected,
+                mbq_calibration_batches(
+                    processor,
+                    calibration_samples[:config.calibration_samples],
+                    min_pixels=config.min_pixels,
+                    max_pixels=config.max_pixels,
+                ),
+                config,
+                cache_dir=cache_root,
+                key=cache_key,
+                reservoir_rows=32,
+                attention_implementation=calibration_attention,
+            )
+        else:
+            cache_key = calibration_cache_key(
+                model_revision=input_digests["model"],
+                calibration_digest=calibration_subset_digest,
+                selected_names=[item.name for item in selected],
                 min_pixels=config.min_pixels,
                 max_pixels=config.max_pixels,
-            ),
-            cache_dir=calibration_cache_dir or output_dir.parent / "_calibration_cache",
-            key=cache_key,
-            reservoir_rows=32,
-            seed=config.seed,
-        )
+                reservoir_rows=32,
+                seed=config.seed,
+            )
+            stats, cache_hit = collect_calibration_cached(
+                model,
+                selected,
+                calibration_batches(
+                    processor,
+                    calibration_samples[:config.calibration_samples],
+                    min_pixels=config.min_pixels,
+                    max_pixels=config.max_pixels,
+                ),
+                cache_dir=cache_root,
+                key=cache_key,
+                reservoir_rows=32,
+                seed=config.seed,
+            )
 
     applied = apply_method(model, selected, config, stats)
     try:

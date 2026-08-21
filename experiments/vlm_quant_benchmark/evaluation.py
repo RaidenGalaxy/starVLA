@@ -4,12 +4,11 @@ import json
 import math
 import time
 from collections.abc import Iterable
-from contextlib import ExitStack
 from pathlib import Path
 
 import torch
 import torch.nn.functional as F
-from PIL import Image
+from qwen_vl_utils import process_vision_info
 
 from .data import MultimodalSample
 from .metrics import TokenNLL, anls, exact_match, normalize_answer, normalized_edit_similarity
@@ -47,19 +46,19 @@ def processor_inputs(
     min_pixels: int | None = None,
     max_pixels: int | None = None,
 ):
+    messages = _messages(
+        sample, include_target,
+        min_pixels=min_pixels, max_pixels=max_pixels,
+    )
     text = processor.apply_chat_template(
-        _messages(
-            sample, include_target,
-            min_pixels=min_pixels, max_pixels=max_pixels,
-        ), tokenize=False,
+        messages, tokenize=False,
         add_generation_prompt=not include_target,
     )
-    with ExitStack() as stack:
-        images = [
-            stack.enter_context(Image.open(path)).convert("RGB")
-            for path in sample.images
-        ]
-        return processor(text=[text], images=images, return_tensors="pt")
+    images, videos = process_vision_info(messages)
+    return processor(
+        text=[text], images=images, videos=videos,
+        padding=True, return_tensors="pt",
+    )
 
 
 def target_token_span(

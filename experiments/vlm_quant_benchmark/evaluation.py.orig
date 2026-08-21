@@ -1,0 +1,211 @@
+from __future__ import annotations
+
+import json
+import math
+import time
+from collections.abc import Iterable
+from pathlib import Path
+
+import torch
+import torch.nn.functional as F
+from qwen_vl_utils import process_vision_info
+
+from .data import MultimodalSample
+from .metrics import TokenNLL, anls, exact_match, normalize_answer, normalized_edit_similarity
+
+
+def _messages(
+    sample: MultimodalSample,
+    include_target: bool,
+    *,
+    min_pixels: int | None = None,
+    max_pixels: int | None = None,
+) -> list[dict]:
+    image_contents = []
+    for image in sample.images:
+        content = {"type": "image", "image": str(image)}
+        if min_pixels is not None:
+            content["min_pixels"] = min_pixels
+        if max_pixels is not None:
+            content["max_pixels"] = max_pixels
+        image_contents.append(content)
+    messages = [{
+        "role": "user",
+        "content": image_contents + [{"type": "text", "text": sample.prompt}],
+    }]
+    if include_target:
+        messages.append({"role": "assistant", "content": [{"type": "text", "text": sample.target}]})
+    return messages
+
+
+def processor_inputs(
+    processor,
+    sample: MultimodalSample,
+    include_target: bool,
+    *,
+    min_pixels: int | None = None,
+    max_pixels: int | None = None,
+):
+    text = processor.apply_chat_template(
+        _messages(
+            sample, include_target,
+            min_pixels=min_pixels, max_pixels=max_pixels,
+        ), tokenize=False,
+        add_generation_prompt=not include_target,
+    )
+    with ExitStack() as stack:
+        images = [
+            stack.enter_context(Image.open(path)).convert("RGB")
+            for path in sample.images
+        ]
+        return processor(text=[text], images=images, return_tensors="pt")
+
+
+def target_token_span(
+    prompt_input_ids: torch.Tensor,
+    teacher_input_ids: torch.Tensor,
+    *,
+    im_end_token_id: int,
+    excluded_trailing_token_ids: set[int] | None = None,
+) -> tuple[torch.Tensor, list[int]]:
+    """Mask exactly the assistant target text, excluding chat-template suffixes."""
+    prompt = prompt_input_ids.reshape(-1)
+    teacher = teacher_input_ids.reshape(-1)
+    start = prompt.numel()
+    if teacher.numel() <= start or not torch.equal(teacher[:start], prompt):
+        raise ValueError("teacher-forcing prefix differs from generation prompt")
+    suffix = teacher[start:]
+    terminators = (suffix == im_end_token_id).nonzero(as_tuple=False).reshape(-1)
+    if terminators.numel() == 0:
+        raise ValueError("teacher-forcing input has no <|im_end|> terminator")
+    end = start + int(terminators[0].item())
+    excluded = excluded_trailing_token_ids or set()
+    while end > start and int(teacher[end - 1].item()) in excluded:
+        end -= 1
+    if end <= start:
+        raise ValueError("teacher-forcing target contains no scored text tokens")
+    labels = torch.full_like(teacher_input_ids, -100)
+    labels[..., start:end] = teacher_input_ids[..., start:end]
+    return labels, list(range(start, end))
+
+
+def target_token_diagnostic(
+    logits: torch.Tensor,
+    input_ids: torch.Tensor,
+    positions: list[int],
+    tokenizer,
+) -> dict:
+    if not positions:
+        return {"tokens": 0, "total_nll": math.nan, "nll": math.nan,
+                "ppl": math.nan, "token_details": []}
+    prediction_rows = torch.tensor([item - 1 for item in positions], device=logits.device)
+    token_ids = input_ids[0, positions].to(logits.device)
+    log_probs = F.log_softmax(logits[0, prediction_rows].float(), dim=-1)
+    losses = -log_probs.gather(1, token_ids[:, None]).squeeze(1)
+    details = []
+    for position, token_id, loss in zip(positions, token_ids.tolist(), losses.tolist()):
+        details.append({
+            "position": position,
+            "token_id": int(token_id),
+            "token_text": tokenizer.decode(
+                [token_id],
+                skip_special_tokens=False,
+                clean_up_tokenization_spaces=False,
+            ),
+            "nll": float(loss),
+        })
+    total = float(losses.sum().item())
+    mean = total / len(details)
+    return {"tokens": len(details), "total_nll": total, "nll": mean,
+            "ppl": math.exp(mean), "token_details": details}
+
+
+@torch.inference_mode()
+def evaluate_multimodal(model, processor, samples: Iterable[MultimodalSample], *,
+                        max_new_tokens: int, output_jsonl: Path,
+                        min_pixels: int | None = None,
+                        max_pixels: int | None = None) -> dict:
+    output_jsonl.parent.mkdir(parents=True, exist_ok=True)
+    temporary = output_jsonl.with_suffix(output_jsonl.suffix + ".tmp")
+    target_nll, rows = TokenNLL(), []
+    exact_values, anls_values, edit_values = [], [], []
+    tokenizer = processor.tokenizer
+    im_end_token_id = tokenizer.convert_tokens_to_ids("<|im_end|>")
+    if im_end_token_id is None or im_end_token_id < 0:
+        raise ValueError("processor tokenizer does not define <|im_end|>")
+    started = time.perf_counter()
+    with temporary.open("w") as handle:
+        for sample in samples:
+            prompt_inputs = processor_inputs(
+                processor, sample, False,
+                min_pixels=min_pixels, max_pixels=max_pixels,
+            )
+            prompt_length = prompt_inputs["input_ids"].shape[-1]
+            generated = model.generate(
+                **prompt_inputs, do_sample=False,
+                max_new_tokens=max_new_tokens, use_cache=True,
+            )
+            prediction = processor.batch_decode(
+                generated[:, prompt_length:], skip_special_tokens=True,
+                clean_up_tokenization_spaces=False,
+            )[0].strip()
+
+            teacher = processor_inputs(
+                processor, sample, True,
+                min_pixels=min_pixels, max_pixels=max_pixels,
+            )
+            newline_token_ids = set(tokenizer.encode("\n", add_special_tokens=False))
+            labels, target_positions = target_token_span(
+                prompt_inputs["input_ids"], teacher["input_ids"],
+                im_end_token_id=im_end_token_id,
+                excluded_trailing_token_ids=newline_token_ids,
+            )
+            output = model(**teacher, use_cache=False, return_dict=True)
+            target_nll.update(output.logits, labels)
+            target_diagnostic = target_token_diagnostic(
+                output.logits, teacher["input_ids"], target_positions, tokenizer,
+            )
+
+            exact = exact_match(prediction, sample.target)
+            similarity = normalized_edit_similarity(prediction, sample.target)
+            sample_anls = anls(prediction, sample.target)
+            exact_values.append(exact)
+            edit_values.append(similarity)
+            anls_values.append(sample_anls)
+            row = {
+                "id": sample.id,
+                "dataset": sample.dataset,
+                "prediction": prediction,
+                "target": sample.target,
+                "normalized_prediction": normalize_answer(prediction),
+                "exact_match": exact,
+                "anls": sample_anls,
+                "normalized_edit_similarity": similarity,
+                "target_text_diagnostic": target_diagnostic,
+            }
+            rows.append(row)
+            handle.write(json.dumps(row, ensure_ascii=False) + "\n")
+    temporary.replace(output_jsonl)
+    return {
+        "samples": len(rows),
+        "exact_accuracy": sum(exact_values) / len(exact_values) if exact_values else math.nan,
+        "anls": sum(anls_values) / len(anls_values) if anls_values else math.nan,
+        "normalized_edit_similarity": sum(edit_values) / len(edit_values) if edit_values else math.nan,
+        "target_text_diagnostic": target_nll.to_dict(),
+        "elapsed_seconds": time.perf_counter() - started,
+    }
+
+
+@torch.inference_mode()
+def evaluate_token_ids_ppl(model, token_ids: torch.Tensor, *, sequence_length: int = 2048) -> dict:
+    """Paper-style corpus PPL, distinct from conditional answer PPL."""
+    token_ids = token_ids.reshape(-1)
+    metric, windows = TokenNLL(), 0
+    for start in range(0, token_ids.numel() - 1, sequence_length):
+        window = token_ids[start:start + sequence_length].unsqueeze(0)
+        if window.shape[-1] < 2:
+            continue
+        output = model(input_ids=window, use_cache=False, return_dict=True)
+        metric.update(output.logits, window)
+        windows += 1
+    return metric.to_dict() | {"windows": windows, "sequence_length": sequence_length}

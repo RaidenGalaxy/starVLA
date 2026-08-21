@@ -18,9 +18,14 @@ except ImportError as error:  # pragma: no cover - optional dependency
     raise ImportError("Install the pinned open-compass/VLMEvalKit package to use this adapter") from error
 
 from .all_methods import apply_method
-from .calibration import collect_calibration
+from .calibration import calibration_cache_key, collect_calibration_cached
 from .config import ExperimentConfig, MethodName, QuantScope
-from .data import load_manifest
+from .data import load_manifest, sample_manifest_digest
+from .mbq import (
+    collect_mbq_search_cached,
+    mbq_cache_key,
+    mbq_calibration_batches,
+)
 from .official_awq import load_official_awq_dequantized
 from .runner import CALIBRATION_METHODS, calibration_batches, load_reference
 from .selection import select_linears
@@ -44,6 +49,9 @@ class Qwen25VLQuantized(Qwen2VLPromptMixin, BaseModel):
         seed: int = 42,
         strict_qwen_3b: bool = True,
         official_awq_path: str | None = None,
+        calibration_cache_dir: str | None = None,
+        calibration_samples: int = 128,
+        scheme_id: str = "",
         **kwargs,
     ) -> None:
         super().__init__(use_custom_prompt=True, **kwargs)
@@ -61,6 +69,13 @@ class Qwen25VLQuantized(Qwen2VLPromptMixin, BaseModel):
             method_name, scope=quant_scope, weight_bits=bits,
             activation_bits=activation, group_size=group_size,
             zero_point=bits is not None and activation is None,
+            weight_granularity=(
+                "per_output_channel"
+                if method_name == MethodName.MBQ and activation == 8
+                else "groupwise"
+            ),
+            calibration_samples=calibration_samples,
+            scheme_id=scheme_id,
             max_new_tokens=max_new_tokens,
             min_pixels=min_pixels, max_pixels=max_pixels, seed=seed,
         )
@@ -92,20 +107,68 @@ class Qwen25VLQuantized(Qwen2VLPromptMixin, BaseModel):
         if method_name in CALIBRATION_METHODS:
             if not calibration_manifest:
                 raise ValueError(f"{method} requires calibration_manifest")
+            calibration_attention = "sdpa"
             calibration = load_manifest(Path(calibration_manifest))
-            stats = collect_calibration(
-                self.model,
-                selected,
-                calibration_batches(
-                    self.processor,
-                    calibration[:self.quant_config.calibration_samples],
+            calibration_subset = calibration[:self.quant_config.calibration_samples]
+            cache_root = (
+                Path(calibration_cache_dir)
+                if calibration_cache_dir is not None
+                else Path(calibration_manifest).parent / "_calibration_cache"
+            )
+            if method_name == MethodName.MBQ:
+                cache_key = mbq_cache_key(
+                    model_revision=str(Path(model_path).resolve()),
+                    calibration_digest=sample_manifest_digest(calibration_subset),
+                    selected_names=[item.name for item in selected],
+                    config=self.quant_config,
+                    reservoir_rows=32,
+                    attention_implementation=calibration_attention,
+                )
+                stats, self.calibration_cache_hit = collect_mbq_search_cached(
+                    self.model,
+                    selected,
+                    mbq_calibration_batches(
+                        self.processor,
+                        calibration_subset,
+                        min_pixels=min_pixels,
+                        max_pixels=max_pixels,
+                    ),
+                    self.quant_config,
+                    cache_dir=cache_root,
+                    key=cache_key,
+                    reservoir_rows=32,
+                    attention_implementation=calibration_attention,
+                )
+            else:
+                cache_key = calibration_cache_key(
+                    model_revision=str(Path(model_path).resolve()),
+                    calibration_digest=sample_manifest_digest(calibration_subset),
+                    selected_names=[item.name for item in selected],
                     min_pixels=min_pixels,
                     max_pixels=max_pixels,
-                ),
-                reservoir_rows=32,
-                seed=seed,
-            )
+                    reservoir_rows=32,
+                    seed=seed,
+                    attention_implementation=calibration_attention,
+                )
+                stats, self.calibration_cache_hit = collect_calibration_cached(
+                    self.model,
+                    selected,
+                    calibration_batches(
+                        self.processor,
+                        calibration_subset,
+                        min_pixels=min_pixels,
+                        max_pixels=max_pixels,
+                    ),
+                    cache_dir=cache_root,
+                    key=cache_key,
+                    reservoir_rows=32,
+                    seed=seed,
+                    attention_implementation=calibration_attention,
+                )
         self.applied = apply_method(self.model, selected, self.quant_config, stats)
+        if stats is not None:
+            self.applied.audit["calibration_cache_hit"] = self.calibration_cache_hit
+            self.applied.audit["calibration_attention_implementation"] = calibration_attention
 
     def generate_inner(self, message, dataset=None) -> str:
         content = []

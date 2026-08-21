@@ -15,7 +15,7 @@ import torch.nn.functional as F
 from torch import nn
 
 from . import methods as base
-from .calibration import ActivationStats
+from .calibration import ActivationStats, release_cpu_memory
 from .config import ExperimentConfig, MethodName
 from .quantization import normalized_mse, quantize_weight_groupwise
 from .selection import SelectedLinear
@@ -111,6 +111,7 @@ def _sparse_residual(source: nn.Linear, dense_weight: torch.Tensor,
     return indices, values
 
 
+@torch.inference_mode()
 def spqr_linear(source: nn.Linear, stats: ActivationStats, config: ExperimentConfig):
     quantized = quantize_weight_groupwise(
         source.weight, bits=config.weight_bits, group_size=config.group_size,
@@ -146,6 +147,7 @@ def _weighted_codebook(weight: torch.Tensor, sensitivity: torch.Tensor,
     return centers[assignment].reshape_as(weight)
 
 
+@torch.inference_mode()
 def squeezellm_linear(source: nn.Linear, stats: ActivationStats, config: ExperimentConfig):
     weight = source.weight.detach().float()
     restored = torch.empty_like(weight)
@@ -188,6 +190,7 @@ def apply_second_wave(model: nn.Module, selected: list[SelectedLinear], config: 
             setattr(parent, key, replacement)
             audits[item.name] = audit | {"subsystem": item.subsystem}
             audits[item.name]["weight_count"] = item.module.weight.numel()
+            release_cpu_memory()
     except Exception:
         for name, original in originals.items():
             parent, key = base._parent_and_key(model, name); setattr(parent, key, original)

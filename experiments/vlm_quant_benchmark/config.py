@@ -14,6 +14,7 @@ class MethodName(StrEnum):
     BF16_REFERENCE = "bf16_value_fp32_compute"
     RTN = "rtn"
     AWQ = "awq"
+    MBQ = "mbq"
     GPTQ = "gptq"
     SMOOTHQUANT = "smoothquant"
     LLM_INT8 = "llm_int8"
@@ -58,6 +59,13 @@ class ExperimentConfig:
     max_new_tokens: int = 128
     awq_alpha_grid: tuple[float, ...] = tuple(i / 20 for i in range(21))
     awq_clip_grid: tuple[float, ...] = (1.0, 0.95, 0.90, 0.85)
+    mbq_scale_grid: tuple[float, ...] = tuple(i / 20 for i in range(20))
+    mbq_loss_mode: str = "mae"
+    mbq_reweight: bool = True
+    mbq_distort: bool = False
+    mbq_upstream_commit: str = "a4d460dfb4b1c07b5d1f3ddda6e86d1c90d6e7f1"
+    mbq_algorithm_version: int = 2
+    weight_granularity: str = "groupwise"
     smoothquant_alpha: float = 0.5
     llm_int8_threshold: float = 6.0
     tender_groups: int = 4
@@ -93,6 +101,33 @@ class ExperimentConfig:
             raise ValueError("pixel bounds must satisfy 0 < min_pixels <= max_pixels")
         if self.judge_nproc <= 0 or self.judge_retries < 0:
             raise ValueError("invalid judge concurrency/retry settings")
+        if not self.mbq_scale_grid or any(
+            value < 0 or value >= 1 for value in self.mbq_scale_grid
+        ):
+            raise ValueError("mbq_scale_grid values must satisfy 0 <= value < 1")
+        if self.mbq_loss_mode != "mae":
+            raise ValueError("the validated MBQ path supports MAE reconstruction only")
+        if self.mbq_algorithm_version != 2:
+            raise ValueError("unsupported MBQ algorithm version")
+        if self.weight_granularity not in {"groupwise", "per_output_channel"}:
+            raise ValueError("unsupported weight granularity")
+        if self.method == MethodName.MBQ:
+            if self.scope != QuantScope.DECODER_CANONICAL:
+                raise ValueError("MBQ supports decoder_canonical scope only")
+            if self.weight_bits != 4:
+                raise ValueError("MBQ supports W4 weights only in this benchmark")
+            if not self.mbq_reweight or self.mbq_distort:
+                raise ValueError("validated MBQ requires reweight=True and distort=False")
+            if self.activation_bits is None:
+                if not self.zero_point or self.weight_granularity != "groupwise":
+                    raise ValueError("MBQ W4A16 requires asymmetric group-wise weights")
+            elif self.activation_bits == 8:
+                if self.zero_point or self.weight_granularity != "per_output_channel":
+                    raise ValueError(
+                        "MBQ W4A8 requires symmetric per-output-channel weights"
+                    )
+            else:
+                raise ValueError("MBQ supports W4A16 or W4A8 only")
         tier = ImplementationTier(self.implementation_tier)
         object.__setattr__(self, "implementation_tier", tier)
         if not self.scheme_id:
@@ -118,7 +153,7 @@ class ExperimentConfig:
         payload = {key: item for key, item in value.items() if key in fields}
         payload["method"] = MethodName(payload["method"])
         payload["scope"] = QuantScope(payload.get("scope", QuantScope.DECODER_CANONICAL))
-        for key in ("awq_alpha_grid", "awq_clip_grid"):
+        for key in ("awq_alpha_grid", "awq_clip_grid", "mbq_scale_grid"):
             if key in payload:
                 payload[key] = tuple(payload[key])
         return cls(**payload)
@@ -160,8 +195,6 @@ def default_matrix() -> list[ExperimentConfig]:
                 ExperimentConfig(MethodName.SMOOTHQUANT, scope=scope, weight_bits=8, activation_bits=8),
                 ExperimentConfig(MethodName.LLM_INT8, scope=scope, weight_bits=8, activation_bits=8),
                 ExperimentConfig(MethodName.TENDER, scope=scope, weight_bits=8, activation_bits=8),
-                ExperimentConfig(MethodName.TENDER, scope=scope, weight_bits=4, activation_bits=4,
-                                 zero_point=False),
             ]
         )
     return configs

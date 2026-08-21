@@ -390,6 +390,9 @@ def main() -> None:
             seed=args.seed,
             strict_qwen_3b=not args.allow_nonstandard_model,
             official_awq_path=args.official_awq_path,
+            calibration_cache_dir=str(args.output_dir.parent / "_calibration_cache"),
+            calibration_samples=2 if args.preset == "smoke" else 128,
+            scheme_id=scheme,
         )
         audit = (
             model.official_awq_audit if args.official_awq_path else model.applied.audit

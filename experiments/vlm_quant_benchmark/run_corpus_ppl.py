@@ -89,6 +89,11 @@ def main() -> None:
     method, scope = MethodName(args.method), QuantScope(args.scope)
     if scope != QuantScope.DECODER_CANONICAL:
         raise ValueError("corpus PPL is decoder_canonical only; text inputs do not execute vision modules")
+    if method == MethodName.MBQ:
+        raise ValueError(
+            "MBQ requires multimodal SFT-gradient calibration; prepare and evaluate it "
+            "through run_mbq_prepare/run_mbq_comparison"
+        )
     activation = args.activation_bits
     if activation is None and method in {MethodName.SMOOTHQUANT, MethodName.LLM_INT8, MethodName.VECTORWISE_W8, MethodName.TENDER}:
         activation = 8

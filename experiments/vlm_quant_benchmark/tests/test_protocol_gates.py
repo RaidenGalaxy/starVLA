@@ -1,5 +1,6 @@
 import json
 import math
+from types import SimpleNamespace
 
 import pytest
 import pandas as pd
@@ -9,6 +10,7 @@ from torch import nn
 from experiments.vlm_quant_benchmark.calibration import (
     ActivationCollector,
     calibration_cache_key,
+    collect_calibration,
     collect_calibration_cached,
     load_calibration_cache,
 )
@@ -139,10 +141,39 @@ def test_corpus_batch_1_2_4_matches_without_cross_document_transitions():
 class CollectorToy(nn.Module):
     def __init__(self):
         super().__init__()
+        self.config = SimpleNamespace(_attn_implementation="eager")
+        self.attention_implementations = []
         self.linear = nn.Linear(4, 3, bias=False)
 
     def forward(self, input_ids, **_kwargs):
+        self.attention_implementations.append(self.config._attn_implementation)
         return type("Output", (), {"logits": self.linear(input_ids.float())})
+
+
+def test_calibration_temporarily_uses_requested_attention_and_restores_config():
+    model = CollectorToy()
+    selected = [SelectedLinear("linear", model.linear, "decoder_ffn", 12)]
+    collect_calibration(
+        model,
+        selected,
+        [{"input_ids": torch.ones(2, 4)}],
+        reservoir_rows=2,
+        attention_implementation="sdpa",
+    )
+    assert model.attention_implementations == ["sdpa"]
+    assert model.config._attn_implementation == "eager"
+    common = dict(
+        model_revision="model-a",
+        calibration_digest="manifest-a",
+        selected_names=["linear"],
+        min_pixels=1,
+        max_pixels=2,
+        reservoir_rows=2,
+        seed=42,
+    )
+    assert calibration_cache_key(**common) != calibration_cache_key(
+        **common, attention_implementation="sdpa",
+    )
 
 
 def test_deterministic_reservoir_cache_and_key_mismatch(tmp_path):
