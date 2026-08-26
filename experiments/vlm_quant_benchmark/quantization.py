@@ -54,8 +54,8 @@ def quantize_weight_groupwise(
     _require_finite(weight, "weight")
     if weight.ndim != 2:
         raise ValueError("weight must have [out_features, in_features] shape")
-    if bits not in (4, 8):
-        raise ValueError("only W4 and W8 are supported")
+    if bits not in (3, 4, 8):
+        raise ValueError("only W3, W4, and W8 are supported")
     if not (0 < clip_ratio <= 1):
         raise ValueError("clip_ratio must be in (0, 1]")
 

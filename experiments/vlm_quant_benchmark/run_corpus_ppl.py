@@ -14,6 +14,12 @@ from .calibration import (
 )
 from .config import ExperimentConfig, ImplementationTier, MethodName, QuantScope
 from .corpus_evaluation import evaluate_token_sequences_ppl, paired_window_delta
+from .data import load_manifest, sample_manifest_digest
+from .mbq import (
+    collect_mbq_search_cached,
+    mbq_cache_key,
+    mbq_calibration_batches,
+)
 from .provenance import completed_run, mark_complete, sha256_json, source_digest
 from .reporting import atomic_json
 from .runner import CALIBRATION_METHODS, environment_record, load_reference
@@ -28,10 +34,13 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--method", choices=sorted({item.value for item in MethodName}), required=True)
     parser.add_argument("--scope", choices=[item.value for item in QuantScope], default="decoder_canonical")
     parser.add_argument("--preset", choices=("smoke", "screen", "full"), default="screen")
-    parser.add_argument("--weight-bits", type=int, choices=(4, 8))
-    parser.add_argument("--activation-bits", type=int, choices=(4, 8))
+    parser.add_argument("--weight-bits", type=int, choices=(3, 4, 8))
+    parser.add_argument("--activation-bits", type=int, choices=(8,))
     parser.add_argument("--group-size", type=int, default=128)
     parser.add_argument("--scheme-id")
+    parser.add_argument("--calibration-manifest", type=Path)
+    parser.add_argument(
+        "--weight-granularity", choices=("groupwise", "per_output_channel"))
     parser.add_argument("--batch-size", type=int, default=4)
     parser.add_argument("--reference-metrics", type=Path)
     parser.add_argument("--calibration-cache-dir", type=Path)
@@ -89,11 +98,6 @@ def main() -> None:
     method, scope = MethodName(args.method), QuantScope(args.scope)
     if scope != QuantScope.DECODER_CANONICAL:
         raise ValueError("corpus PPL is decoder_canonical only; text inputs do not execute vision modules")
-    if method == MethodName.MBQ:
-        raise ValueError(
-            "MBQ requires multimodal SFT-gradient calibration; prepare and evaluate it "
-            "through run_mbq_prepare/run_mbq_comparison"
-        )
     activation = args.activation_bits
     if activation is None and method in {MethodName.SMOOTHQUANT, MethodName.LLM_INT8, MethodName.VECTORWISE_W8, MethodName.TENDER}:
         activation = 8
@@ -102,6 +106,11 @@ def main() -> None:
         weight_bits, activation = None, None
     elif weight_bits is None:
         weight_bits = 8 if activation == 8 else 4
+    weight_granularity = args.weight_granularity or (
+        "per_output_channel"
+        if method == MethodName.MBQ and activation == 8
+        else "groupwise"
+    )
     tier = (
         ImplementationTier.REFERENCE
         if method == MethodName.BF16_VALUE_FP32_COMPUTE
@@ -117,16 +126,23 @@ def main() -> None:
         weight_bits=weight_bits,
         activation_bits=activation,
         zero_point=weight_bits is not None and activation is None,
+        weight_granularity=weight_granularity,
         group_size=args.group_size,
         scheme_id=args.scheme_id or "",
         implementation_tier=tier,
-        calibration_protocol="none" if method == MethodName.BF16_VALUE_FP32_COMPUTE else "c4_128x2048",
+        calibration_protocol=(
+            "none" if method == MethodName.BF16_VALUE_FP32_COMPUTE
+            else "multimodal_train_4x32" if method == MethodName.MBQ
+            else "c4_128x2048"
+        ),
         calibration_samples=2 if args.preset == "smoke" else 128,
         awq_alpha_grid=(0.0, 0.5, 1.0) if args.preset == "smoke" else ExperimentConfig.awq_alpha_grid,
         awq_clip_grid=(1.0, 0.9) if args.preset == "smoke" else ExperimentConfig.awq_clip_grid,
         omniquant_steps=2 if args.preset == "smoke" else 20,
         squeezellm_kmeans_steps=1 if args.preset == "smoke" else 5,
     )
+    if method == MethodName.MBQ and args.calibration_manifest is None:
+        raise ValueError("MBQ corpus evaluation requires --calibration-manifest")
     model_digest = source_digest(args.model_path)
     corpus_files = {
         "wikitext2_test": args.corpora_dir / "wikitext2_test.pt",
@@ -135,7 +151,11 @@ def main() -> None:
     }
     input_digests = {
         "model": model_digest,
-        "calibration": source_digest(args.corpora_dir / "c4_calibration_128x2048.pt"),
+        "calibration": source_digest(
+            args.calibration_manifest
+            if method == MethodName.MBQ
+            else args.corpora_dir / "c4_calibration_128x2048.pt"
+        ),
         "preset": sha256_json(args.preset),
         "max_windows": sha256_json({"smoke": 2, "screen": 16, "full": None}[args.preset]),
         **{name: source_digest(path) for name, path in corpus_files.items()},
@@ -157,12 +177,40 @@ def main() -> None:
         "environment": environment_record(),
     })
     try:
-        model, _processor, conversion = load_reference(args.model_path)
+        model, processor, conversion = load_reference(args.model_path)
         atomic_json(args.output_dir / "reference_conversion.json", conversion)
         selected = select_linears(model, scope, strict_qwen_3b=not args.allow_nonstandard_model)
         atomic_json(args.output_dir / "module_inventory.json", inventory(selected))
         calibration, cache_hit = None, False
-        if method in CALIBRATION_METHODS:
+        if method == MethodName.MBQ:
+            cache_dir = (
+                args.calibration_cache_dir or args.output_dir.parent / "_calibration_cache"
+            )
+            samples = load_manifest(args.calibration_manifest)
+            samples = samples[:config.calibration_samples]
+            if len(samples) != config.calibration_samples:
+                raise ValueError("MBQ calibration manifest does not contain enough samples")
+            key = mbq_cache_key(
+                model_revision=model_digest,
+                calibration_digest=sample_manifest_digest(samples),
+                selected_names=[item.name for item in selected],
+                config=config,
+                reservoir_rows=32,
+                attention_implementation="sdpa",
+            )
+            calibration, cache_hit = collect_mbq_search_cached(
+                model, selected,
+                mbq_calibration_batches(
+                    processor, samples,
+                    min_pixels=config.min_pixels, max_pixels=config.max_pixels,
+                ),
+                config,
+                cache_dir=cache_dir,
+                key=key,
+                reservoir_rows=32,
+                attention_implementation="sdpa",
+            )
+        elif method in CALIBRATION_METHODS:
             sequences = load_sequences(args.corpora_dir / "c4_calibration_128x2048.pt")
             if args.preset == "smoke":
                 sequences = sequences[:2]

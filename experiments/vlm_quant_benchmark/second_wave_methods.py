@@ -70,21 +70,32 @@ def omniquant_linear(source: nn.Linear, stats: ActivationStats, config: Experime
     activation = stats.abs_max.clamp_min(1e-6)
     weight_max = weight.abs().amax(0).clamp_min(1e-6)
     initial = (activation.pow(0.5) / weight_max.pow(0.5)).clamp_min(1e-6)
-    log_scale = nn.Parameter(initial.log())
-    clip_logit = nn.Parameter(torch.tensor(5.0))
-    optimizer = torch.optim.Adam((log_scale, clip_logit), lr=2e-2)
-    curve = []
-    for _ in range(config.omniquant_steps):
-        scale = log_scale.exp().clamp(1e-4, 1e4)
-        clip = 0.5 + 0.5 * torch.sigmoid(clip_logit)
-        candidate_weight = _ste_qdq(
-            weight * scale.unsqueeze(0), config.weight_bits,
-            config.group_size, config.zero_point, clip,
-        )
-        candidate = F.linear(sample / scale, candidate_weight, None)
-        loss = (candidate - reference).square().mean() / reference.square().mean().clamp_min(1e-8)
-        optimizer.zero_grad(); loss.backward(); optimizer.step()
-        curve.append(float(loss.detach()))
+    # VLMEvalKit disables autograd globally while importing its model registry.
+    # OmniQuant deliberately needs a small optimization loop, so establish a
+    # scoped grad context and restore the caller's state automatically on exit.
+    with torch.enable_grad():
+        log_scale = nn.Parameter(initial.log())
+        clip_logit = nn.Parameter(torch.tensor(5.0))
+        optimizer = torch.optim.Adam((log_scale, clip_logit), lr=2e-2)
+        curve = []
+        for _ in range(config.omniquant_steps):
+            scale = log_scale.exp().clamp(1e-4, 1e4)
+            clip = 0.5 + 0.5 * torch.sigmoid(clip_logit)
+            candidate_weight = _ste_qdq(
+                weight * scale.unsqueeze(0), config.weight_bits,
+                config.group_size, config.zero_point, clip,
+            )
+            candidate = F.linear(sample / scale, candidate_weight, None)
+            loss = (
+                (candidate - reference).square().mean()
+                / reference.square().mean().clamp_min(1e-8)
+            )
+            if not torch.isfinite(loss):
+                raise ValueError("non-finite OmniQuant LET/LWC loss")
+            optimizer.zero_grad()
+            loss.backward()
+            optimizer.step()
+            curve.append(float(loss.detach()))
     scale = log_scale.detach().exp().clamp(1e-4, 1e4)
     clip = float((0.5 + 0.5 * torch.sigmoid(clip_logit.detach())).item())
     quantized = quantize_weight_groupwise(
@@ -129,8 +140,11 @@ def spqr_linear(source: nn.Linear, stats: ActivationStats, config: ExperimentCon
 
 def _weighted_codebook(weight: torch.Tensor, sensitivity: torch.Tensor,
                        levels: int, steps: int) -> torch.Tensor:
-    flat = weight.reshape(-1)
-    weights = sensitivity.unsqueeze(0).expand(weight.shape[0], -1).reshape(-1).clamp_min(1e-8)
+    flat = weight.contiguous().reshape(-1)
+    weights = (
+        sensitivity.unsqueeze(0).expand(weight.shape[0], -1).contiguous()
+        .reshape(-1).clamp_min(1e-8)
+    )
     centers = torch.quantile(flat, torch.linspace(0, 1, levels, device=flat.device))
     for _ in range(steps):
         insertion = torch.bucketize(flat, centers)

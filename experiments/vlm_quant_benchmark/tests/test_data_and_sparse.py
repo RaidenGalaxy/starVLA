@@ -13,7 +13,11 @@ from experiments.vlm_quant_benchmark.prepare_vlmeval_screen import (
     _canonical_target,
     _stratified_circular_indices,
 )
-from experiments.vlm_quant_benchmark.second_wave_methods import SparseCorrectionLinear, omniquant_linear
+from experiments.vlm_quant_benchmark.second_wave_methods import (
+    SparseCorrectionLinear,
+    omniquant_linear,
+    squeezellm_linear,
+)
 
 
 def write_sample(root, name, identifier, split, color):
@@ -81,6 +85,28 @@ def test_omniquant_accepts_inference_mode_calibration_tensors():
     assert torch.isfinite(wrapper(torch.randn(2, 4))).all()
 
 
+def test_omniquant_enables_grad_locally_and_restores_global_state():
+    source = nn.Linear(4, 3, bias=False)
+    reservoir = torch.randn(2, 4)
+    stats = ActivationStats(
+        abs_sum=reservoir.abs().sum(0),
+        abs_max=reservoir.abs().amax(0),
+        rows=2,
+        reservoir=reservoir,
+    )
+    config = ExperimentConfig(MethodName.OMNIQUANT, omniquant_steps=2)
+    previous = torch.is_grad_enabled()
+    try:
+        torch.set_grad_enabled(False)
+        wrapper, audit = omniquant_linear(source, stats, config)
+        assert not torch.is_grad_enabled()
+        assert len(audit["loss_curve"]) == 2
+        assert all(torch.isfinite(torch.tensor(audit["loss_curve"])))
+        assert torch.isfinite(wrapper(torch.randn(2, 4))).all()
+    finally:
+        torch.set_grad_enabled(previous)
+
+
 def test_screen_sampler_keeps_exact_complete_circular_groups():
     rows = []
     for group in range(16):
@@ -104,7 +130,23 @@ def test_screen_target_uses_plain_first_docvqa_answer():
     assert _canonical_target("DocVQA_VAL", ["primary", "alternative"]) == "primary"
 
 
-def test_screen_target_does_not_parse_other_dataset_bracket_text():
-    assert _canonical_target("MathVista_MINI", "[1, 2]") == "[1, 2]"
+def test_screen_target_uses_first_reference_for_active_vqa_datasets():
+    assert _canonical_target("TextVQA_VAL", "['one', '1']") == "one"
     malformed = "[not valid Python"
     assert _canonical_target("DocVQA_VAL", malformed) == malformed
+
+
+def test_squeezellm_w3_uses_exactly_eight_centroids():
+    source = nn.Linear(9, 3, bias=False)
+    reservoir = torch.randn(4, 9)
+    stats = ActivationStats(
+        abs_sum=reservoir.abs().sum(0), abs_max=reservoir.abs().amax(0),
+        rows=4, reservoir=reservoir,
+    )
+    config = ExperimentConfig(
+        MethodName.SQUEEZELLM, weight_bits=3, group_size=4,
+        scheme_id="squeezellm_w3a16_g4_asym",
+    )
+    wrapper, audit = squeezellm_linear(source, stats, config)
+    assert audit["centroids"] == 8
+    assert torch.isfinite(wrapper(torch.randn(2, 9))).all()

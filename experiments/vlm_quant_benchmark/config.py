@@ -87,10 +87,10 @@ class ExperimentConfig:
     format_version: int = 2
 
     def __post_init__(self) -> None:
-        if self.weight_bits not in (None, 4, 8):
-            raise ValueError("weight_bits must be None, 4, or 8")
-        if self.activation_bits not in (None, 4, 8):
-            raise ValueError("activation_bits must be None, 4, or 8")
+        if self.weight_bits not in (None, 3, 4, 8):
+            raise ValueError("weight_bits must be None, 3, 4, or 8")
+        if self.activation_bits not in (None, 8):
+            raise ValueError("active configurations support A16 or A8 only")
         if self.group_size <= 0:
             raise ValueError("group_size must be positive")
         if self.calibration_samples <= 0 or self.calibration_tokens <= 0:
@@ -114,20 +114,22 @@ class ExperimentConfig:
         if self.method == MethodName.MBQ:
             if self.scope != QuantScope.DECODER_CANONICAL:
                 raise ValueError("MBQ supports decoder_canonical scope only")
-            if self.weight_bits != 4:
-                raise ValueError("MBQ supports W4 weights only in this benchmark")
+            if self.weight_bits not in (3, 4):
+                raise ValueError("MBQ supports W3 or W4 weights in this benchmark")
+            if self.weight_bits == 3 and self.activation_bits is not None:
+                raise ValueError("W3 is evaluated as W3A16 only")
             if not self.mbq_reweight or self.mbq_distort:
                 raise ValueError("validated MBQ requires reweight=True and distort=False")
             if self.activation_bits is None:
                 if not self.zero_point or self.weight_granularity != "groupwise":
-                    raise ValueError("MBQ W4A16 requires asymmetric group-wise weights")
+                    raise ValueError("MBQ W3A16/W4A16 requires asymmetric group-wise weights")
             elif self.activation_bits == 8:
                 if self.zero_point or self.weight_granularity != "per_output_channel":
                     raise ValueError(
                         "MBQ W4A8 requires symmetric per-output-channel weights"
                     )
             else:
-                raise ValueError("MBQ supports W4A16 or W4A8 only")
+                raise ValueError("MBQ supports W3A16, W4A16, or W4A8 only")
         tier = ImplementationTier(self.implementation_tier)
         object.__setattr__(self, "implementation_tier", tier)
         if not self.scheme_id:

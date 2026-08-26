@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 import ast
+import hashlib
 import os
 import random
 from pathlib import Path
@@ -14,9 +15,16 @@ from .data import (
     normalized_question_digest,
     write_manifest,
 )
+from .dataset_protocol import (
+    ACTIVE_DATASET_NAMES,
+    DATASET_SPECS,
+    PROTOCOL_VERSION,
+    canonical_answers,
+)
+from .reporting import atomic_json
 
 
-DATASETS = ("DocVQA_VAL", "MathVista_MINI", "MMMU_DEV_VAL", "MMBench_DEV_EN")
+DATASETS = ACTIVE_DATASET_NAMES
 VLMEVALKIT_REVISION = "4c4540cb19610b166499d004873674d00c88680f"
 
 
@@ -35,21 +43,7 @@ def _value(line, names, default=""):
 
 def _canonical_target(dataset_name: str, value) -> str:
     """Return one plain target string for local teacher-forcing diagnostics."""
-    if isinstance(value, (list, tuple)):
-        if not value:
-            raise ValueError(f"empty answer list for {dataset_name}")
-        target = str(value[0]).strip()
-    else:
-        target = str(value).strip()
-        if dataset_name == "DocVQA_VAL":
-            try:
-                parsed = ast.literal_eval(target)
-            except (SyntaxError, ValueError):
-                parsed = None
-            if isinstance(parsed, (list, tuple)):
-                if not parsed:
-                    raise ValueError("empty DocVQA answer list")
-                target = str(parsed[0]).strip()
+    target = canonical_answers(value)[0]
     if not target:
         raise ValueError(f"empty canonical target for {dataset_name}")
     return target
@@ -124,6 +118,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--output-dir", type=Path, required=True)
     parser.add_argument("--lmu-data-root", type=Path)
     parser.add_argument("--calibration-manifest", type=Path)
+    parser.add_argument("--previous-manifest", type=Path)
     parser.add_argument("--samples-per-dataset", type=int, default=64)
     parser.add_argument("--seed", type=int, default=42)
     return parser.parse_args()
@@ -151,14 +146,37 @@ def main() -> None:
             return self.dataset_object.dump_image(line)
 
     args.output_dir.mkdir(parents=True, exist_ok=True)
+    preserved: dict[str, list[str]] = {}
+    if args.previous_manifest is not None:
+        for sample in load_manifest(args.previous_manifest):
+            if sample.dataset in {"DocVQA_VAL", "MMMU_DEV_VAL"}:
+                preserved.setdefault(sample.dataset, []).append(sample.official_index)
     samples = []
-    for dataset_offset, dataset_name in enumerate(DATASETS):
+    for dataset_name in DATASETS:
         dataset = build_dataset(dataset_name)
-        positions = _stratified_circular_indices(
-            dataset.data,
-            args.samples_per_dataset,
-            args.seed + dataset_offset,
-        )
+        if dataset_name in preserved:
+            wanted = preserved[dataset_name]
+            if len(wanted) != args.samples_per_dataset:
+                raise ValueError(
+                    f"{dataset_name} preserved manifest must have "
+                    f"{args.samples_per_dataset} rows"
+                )
+            positions_by_index = {
+                str(_value(row, ("index", "id"), position)): position
+                for position, (_, row) in enumerate(dataset.data.iterrows())
+            }
+            try:
+                positions = [positions_by_index[str(index)] for index in wanted]
+            except KeyError as error:
+                raise ValueError(
+                    f"preserved {dataset_name} index absent upstream: {error}"
+                ) from error
+        else:
+            positions = _stratified_circular_indices(
+                dataset.data,
+                args.samples_per_dataset,
+                args.seed,
+            )
         builder = PromptBuilder(dataset)
         for position in positions:
             line = dataset.data.iloc[position]
@@ -190,7 +208,46 @@ def main() -> None:
             ))
     if args.calibration_manifest is not None:
         assert_disjoint(load_manifest(args.calibration_manifest), samples)
-    write_manifest(args.output_dir / "vlm_screen_4x64.jsonl", samples)
+    manifest_path = args.output_dir / "vlm_screen_4x64.jsonl"
+    write_manifest(manifest_path, samples)
+
+    def md5(path: Path) -> str:
+        digest = hashlib.md5()
+        with path.open("rb") as handle:
+            while chunk := handle.read(1024 * 1024):
+                digest.update(chunk)
+        return digest.hexdigest()
+
+    dataset_files = {}
+    for dataset_name in DATASETS:
+        source = lmu_root / f"{dataset_name}.tsv"
+        if not source.is_file():
+            raise FileNotFoundError(source)
+        dataset_files[dataset_name] = {
+            "path": str(source.resolve()),
+            "bytes": source.stat().st_size,
+            "md5": md5(source),
+            "sha256": file_digest(source),
+            "source_split": DATASET_SPECS[dataset_name].source_split,
+        }
+    atomic_json(args.output_dir / "dataset_protocol.json", {
+        "protocol_version": PROTOCOL_VERSION,
+        "vlmevalkit_revision": VLMEVALKIT_REVISION,
+        "seed": args.seed,
+        "samples_per_dataset": args.samples_per_dataset,
+        "datasets": dataset_files,
+        "manifest": {
+            "path": str(manifest_path.resolve()),
+            "sha256": file_digest(manifest_path),
+            "rows": len(samples),
+        },
+        "generation": {
+            "temperature": 0,
+            "max_new_tokens": 128,
+            "prompt_builder": "pinned_Qwen2VLPromptMixin",
+            "answer_postprocess_version": PROTOCOL_VERSION,
+        },
+    })
 
 
 if __name__ == "__main__":

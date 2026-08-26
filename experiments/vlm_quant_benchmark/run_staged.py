@@ -1,3 +1,4 @@
+"""Legacy four-dataset scheduler; retained only for historical reproducibility."""
 from __future__ import annotations
 
 import argparse
@@ -63,6 +64,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--resume", action="store_true")
     parser.add_argument("--dry-run", action="store_true")
     parser.add_argument("--continue-on-failure", action="store_true")
+    parser.add_argument("--allow-legacy-old-4dataset-protocol", action="store_true")
     return parser.parse_args()
 
 
@@ -371,6 +373,11 @@ def estimate_from_timing(output_dir: Path) -> dict[str, float]:
 
 def main() -> None:
     args = parse_args()
+    if not args.allow_legacy_old_4dataset_protocol:
+        raise SystemExit(
+            "run_staged is legacy_old_4dataset_protocol; use run_top4_protocol, "
+            "or pass --allow-legacy-old-4dataset-protocol for historical replay"
+        )
     if args.lmu_data_root is None:
         args.lmu_data_root = args.screen_manifest.parent.parent / "LMUData"
     args.output_dir.mkdir(parents=True, exist_ok=True)

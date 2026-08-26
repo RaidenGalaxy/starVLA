@@ -350,17 +350,43 @@ def test_official_prompt_uses_injected_dataset_image_dumper():
 
 
 def test_official_score_extraction_uses_dataset_specific_columns(tmp_path):
-    doc = pd.DataFrame({"index": [1, 2], "eval_score": [0.75, 1.0], "res": ["x", "y"]})
+    doc = pd.DataFrame({
+        "index": [1, 2], "answer": ["['hello', 'hi']", "world"],
+        "prediction": ["hello", "unrelated"], "eval_score": [0.0, 1.0],
+    })
     scores = extract_scores(
         "DocVQA_VAL", doc, tmp_path, ["1", "2"], lambda _path: None,
     )
-    assert scores == {"1": 0.75, "2": 1.0}
+    assert scores == {"1": 1.0, "2": 0.0}
+
+    distance_only = pd.DataFrame({"index": [1], "eval_score": [0.01]})
+    with pytest.raises(RuntimeError, match="did not expose"):
+        extract_scores("DocVQA_VAL", distance_only, tmp_path, ["1"], lambda _path: None)
 
     mcq = pd.DataFrame({"index": [3, 4], "hit": [1, 0], "score": [0.2, 0.8]})
     scores = extract_scores(
         "MMMU_DEV_VAL", mcq, tmp_path, ["3", "4"], lambda _path: None,
     )
     assert scores == {"3": 1.0, "4": 0.0}
+
+    textvqa = pd.DataFrame({
+        "index": [5], "answer": [str(["cat"] * 2 + ["dog"] * 8)],
+        "prediction": ["CAT!"], "eval_score": [0.0],
+    })
+    scores = extract_scores(
+        "TextVQA_VAL", textvqa, tmp_path, ["5"], lambda _path: None,
+    )
+    assert scores == {"5": pytest.approx(2 / 3)}
+
+
+def test_local_mcq_extraction_covers_mmmu_and_scienceqa_formats():
+    from vlmeval.utils import can_infer
+
+    choices = {"A": "alpha", "B": "beta", "C": "gamma"}
+    assert can_infer("A", choices) == "A"
+    assert can_infer("A.", choices) == "A"
+    assert can_infer("The answer is A", choices) == "A"
+    assert can_infer("invalid output", choices) is False
 
 
 def test_fixed_mathvista_judge_retries_three_times_at_zero(monkeypatch):

@@ -1,0 +1,40 @@
+import pandas as pd
+
+from experiments.vlm_quant_benchmark.score_local_proxy import (
+    fallback_choice,
+    list_match,
+    numeric_match,
+    score_row,
+    text_match,
+)
+
+
+def no_infer(_prediction, _choices):
+    return False
+
+
+def test_choice_extracts_leading_option():
+    row = pd.Series({"prediction": "B. yes", "answer": "B", "A": "no", "B": "yes"})
+    assert score_row("MMBench_DEV_EN", row, no_infer)["score"] == 1.0
+
+
+def test_mathvista_float_uses_explicit_final_answer():
+    correct, extracted = numeric_match("First 3.0. Final answer: 1.20", "1.2")
+    assert correct
+    assert extracted == "1.2"
+
+
+def test_integer_rejects_non_integer_prediction():
+    assert not numeric_match("Final answer: 2.5", "2", integer=True)[0]
+
+
+def test_list_normalization():
+    assert list_match("Therefore [2007, 2008]", "[2007, 2008]")[0]
+
+
+def test_text_alias_list():
+    assert text_match("Final answer: MgS", "['$MgS$', 'MgS']")[0]
+
+
+def test_fallback_choice_uses_unique_choice_text():
+    assert fallback_choice("It is the second image", {"A": "first image", "B": "second image"}) == "B"

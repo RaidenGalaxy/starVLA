@@ -80,11 +80,11 @@ class ToyMBQVLM(nn.Module):
         return SimpleNamespace(loss=loss, logits=logits)
 
 
-def mbq_config(*, activation_bits=None):
+def mbq_config(*, activation_bits=None, weight_bits=4):
     return ExperimentConfig(
         MethodName.MBQ,
         scope=QuantScope.DECODER_CANONICAL,
-        weight_bits=4,
+        weight_bits=weight_bits,
         activation_bits=activation_bits,
         group_size=4,
         zero_point=activation_bits is None,
@@ -92,7 +92,7 @@ def mbq_config(*, activation_bits=None):
             "per_output_channel" if activation_bits == 8 else "groupwise"
         ),
         mbq_scale_grid=(0.0, 0.5),
-        scheme_id=f"toy_w4a{activation_bits or 16}",
+        scheme_id=f"toy_w{weight_bits}a{activation_bits or 16}",
     )
 
 
@@ -110,7 +110,12 @@ def toy_batch():
 
 def test_mbq_configuration_gates():
     mbq_config()
+    mbq_config(weight_bits=3)
     mbq_config(activation_bits=8)
+    with pytest.raises(ValueError, match="A16 or A8"):
+        ExperimentConfig(MethodName.RTN, activation_bits=4)
+    with pytest.raises(ValueError, match="W3A16 only"):
+        mbq_config(weight_bits=3, activation_bits=8)
     with pytest.raises(ValueError, match="decoder_canonical"):
         ExperimentConfig(MethodName.MBQ, scope=QuantScope.FULL_VLM_EXTENDED)
     with pytest.raises(ValueError, match="per-output-channel"):
@@ -136,8 +141,8 @@ def test_mbq_collects_modal_activations_and_sft_gradient_ratios():
     assert all(value.vision.shape[0] == 2 for value in stats.values())
 
 
-@pytest.mark.parametrize("activation_bits", [None, 8])
-def test_mbq_search_apply_and_restore_are_finite(activation_bits):
+@pytest.mark.parametrize("weight_bits,activation_bits", [(3, None), (4, None), (4, 8)])
+def test_mbq_search_apply_and_restore_are_finite(weight_bits, activation_bits):
     torch.manual_seed(11)
     model = ToyMBQVLM()
     selected = select_linears(model, QuantScope.DECODER_CANONICAL, strict_qwen_3b=False)
@@ -153,7 +158,7 @@ def test_mbq_search_apply_and_restore_are_finite(activation_bits):
         "model.layers.0.self_attn.o_proj": 0.1,
         "model.layers.0.mlp.down_proj": 0.2,
     }
-    config = mbq_config(activation_bits=activation_bits)
+    config = mbq_config(activation_bits=activation_bits, weight_bits=weight_bits)
     result = search_mbq_scales(
         selected, stats, ratios, config,
         {"vision": 4, "language": 4, "samples": 1},
@@ -189,7 +194,16 @@ def test_mbq_cache_key_and_round_trip(tmp_path):
         reservoir_rows=4,
         attention_implementation="sdpa",
     )
+    w3 = mbq_cache_key(
+        model_revision="model-a",
+        calibration_digest="calibration-a",
+        selected_names=[item.name for item in selected],
+        config=mbq_config(weight_bits=3),
+        reservoir_rows=4,
+        attention_implementation="sdpa",
+    )
     assert key != different
+    assert key != w3
     result = MBQSearchResult(
         scales={item.name: torch.ones(item.module.in_features) for item in selected},
         audit={"algorithm": "test"},
@@ -213,15 +227,15 @@ def test_mbq_comparison_is_six_matched_opt_in_configs(tmp_path):
         seed=42,
     )
     configs = comparison_configs(args)
-    assert len(configs) == 6
+    assert len(configs) == 5
     assert [config.method for config in configs] == [
         MethodName.RTN,
-        MethodName.AWQ,
         MethodName.MBQ,
         MethodName.RTN,
         MethodName.SMOOTHQUANT,
         MethodName.MBQ,
     ]
-    assert [config.activation_bits for config in configs] == [None, None, None, 8, 8, 8]
+    assert [config.activation_bits for config in configs] == [None, None, 8, 8, 8]
+    assert not any(config.method == MethodName.AWQ for config in configs)
     assert "mbq" not in LOCAL_METHODS.split(",")
     assert not any(method == "mbq" for method, *_rest in SCHEMES)

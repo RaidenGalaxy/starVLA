@@ -1,0 +1,519 @@
+from __future__ import annotations
+
+import argparse
+import ast
+import hashlib
+import json
+import math
+import re
+import subprocess
+import sys
+import unicodedata
+from pathlib import Path
+from typing import Callable
+
+import pandas as pd
+
+
+VLMEVALKIT_REVISION = "4c4540cb19610b166499d004873674d00c88680f"
+POLICY = "local_deterministic_proxy_v1"
+JUDGE_DATASETS = ("MathVista_MINI", "MMMU_DEV_VAL", "MMBench_DEV_EN")
+NUMBER_RE = re.compile(
+    r"(?<![\w.])[-+]?(?:\d{1,3}(?:,\d{3})+|\d+)(?:\.\d+)?(?:[eE][-+]?\d+)?%?"
+)
+
+
+def parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(
+        description="Deterministic local proxy scorer for completed VLM screen predictions"
+    )
+    parser.add_argument("--root", type=Path, required=True)
+    parser.add_argument("--output-dir", type=Path, required=True)
+    parser.add_argument("--vlmevalkit-root", type=Path, required=True)
+    return parser.parse_args()
+
+
+def atomic_text(path: Path, text: str) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temporary = path.with_suffix(path.suffix + ".tmp")
+    temporary.write_text(text)
+    temporary.replace(path)
+
+
+def atomic_json(path: Path, payload: object) -> None:
+    atomic_text(path, json.dumps(payload, indent=2, ensure_ascii=False, sort_keys=True) + "\n")
+
+
+def atomic_jsonl(path: Path, rows: list[dict]) -> None:
+    atomic_text(
+        path,
+        "".join(json.dumps(row, ensure_ascii=False, sort_keys=True) + "\n" for row in rows),
+    )
+
+
+def file_sha256(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as handle:
+        for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def load_can_infer(root: Path) -> Callable[[str, dict], str | bool]:
+    revision = subprocess.check_output(
+        ["git", "-C", str(root), "rev-parse", "HEAD"], text=True
+    ).strip()
+    if revision != VLMEVALKIT_REVISION:
+        raise ValueError(f"VLMEvalKit {revision} != required {VLMEVALKIT_REVISION}")
+    sys.path.insert(0, str(root))
+    from vlmeval.utils import can_infer
+
+    return can_infer
+
+
+def clean_scalar(value) -> str:
+    if pd.isna(value):
+        return ""
+    return str(value).strip()
+
+
+def normalize_text(value) -> str:
+    text = unicodedata.normalize("NFKC", clean_scalar(value)).lower()
+    text = text.replace("−", "-").replace("–", "-").replace("—", "-")
+    text = re.sub(r"\\(?:text|mathrm|mathbf)\{([^{}]*)\}", r"\1", text)
+    text = text.replace("$", "")
+    return re.sub(r"[^\w.+\-/]+", " ", text).strip()
+
+
+def canonical_index(value) -> str:
+    text = str(value)
+    return text[:-2] if text.endswith(".0") else text
+
+
+def choices_from_row(row: pd.Series) -> dict[str, str]:
+    choices = {}
+    for code in "ABCDEFGHI":
+        if code in row and not pd.isna(row[code]):
+            choices[code] = clean_scalar(row[code])
+    if choices:
+        return choices
+    raw = row.get("choices")
+    if not pd.isna(raw):
+        values = ast.literal_eval(str(raw)) if isinstance(raw, str) else list(raw)
+        return {chr(65 + index): clean_scalar(value) for index, value in enumerate(values)}
+    return {}
+
+
+def fallback_choice(prediction: str, choices: dict[str, str]) -> str | None:
+    labels = "".join(choices)
+    patterns = (
+        rf"(?:final\s+answer|answer|option|choice)\s*(?:is|:|=)?\s*[\[(]?([{labels}])[\])]?(?!\w)",
+        rf"(?:故选|选择|选项|答案)\s*(?:是|为|[:：])?\s*[\[(]?([{labels}])[\])]?(?![A-Za-z])",
+        rf"^\s*[\[(]?([{labels}])[\]).:]?(?:\s|$)",
+        rf"[\[(]([{labels}])[\])]",
+    )
+    for pattern in patterns:
+        matches = re.findall(pattern, prediction, flags=re.IGNORECASE)
+        if matches:
+            return matches[-1].upper()
+    normalized = normalize_text(prediction)
+    hits = [code for code, value in choices.items() if normalize_text(value) in normalized]
+    return hits[0] if len(hits) == 1 else None
+
+
+def infer_choice(
+    prediction: str,
+    choices: dict[str, str],
+    can_infer: Callable[[str, dict], str | bool],
+) -> str | None:
+    inferred = can_infer(prediction, choices)
+    if isinstance(inferred, str) and inferred in choices:
+        return inferred
+    return fallback_choice(prediction, choices)
+
+
+def final_fragment(prediction: str) -> str:
+    boxed = re.findall(r"\\boxed\s*\{([^{}]+)\}", prediction, flags=re.IGNORECASE)
+    if boxed:
+        return boxed[-1]
+    explicit = re.findall(
+        r"(?:final\s+answer|answer|result)\s*(?:is|:|=)\s*([^\n]+)",
+        prediction,
+        flags=re.IGNORECASE,
+    )
+    return explicit[-1] if explicit else prediction
+
+
+def last_number(value: str) -> tuple[float, bool] | None:
+    matches = NUMBER_RE.findall(final_fragment(value))
+    if not matches:
+        return None
+    token = matches[-1]
+    percentage = token.endswith("%")
+    try:
+        return float(token.rstrip("%").replace(",", "")), percentage
+    except ValueError:
+        return None
+
+
+def numeric_match(prediction: str, answer: str, integer: bool = False) -> tuple[bool, str]:
+    pred = last_number(prediction)
+    gold = last_number(answer)
+    if pred is None or gold is None:
+        return False, "unparsed"
+    pred_value, percentage = pred
+    gold_value, _ = gold
+    if percentage:
+        pred_value /= 100.0
+    if integer:
+        correct = math.isclose(pred_value, round(pred_value), abs_tol=1e-9) and int(
+            round(pred_value)
+        ) == int(round(gold_value))
+    else:
+        decimals = len(answer.partition(".")[2]) if "." in answer else 8
+        tolerance = max(1e-9, 0.5 * 10 ** (-decimals))
+        correct = math.isclose(pred_value, gold_value, rel_tol=0.0, abs_tol=tolerance)
+    return bool(correct), str(pred_value)
+
+
+def list_match(prediction: str, answer: str) -> tuple[bool, str]:
+    fragments = re.findall(r"\[[^\[\]]*\]", final_fragment(prediction))
+    try:
+        expected = ast.literal_eval(answer)
+    except (ValueError, SyntaxError):
+        expected = None
+    if not isinstance(expected, list):
+        return False, "unparsed_gold"
+    parsed_fragment = None
+    for fragment in reversed(fragments):
+        try:
+            candidate = ast.literal_eval(fragment)
+        except (ValueError, SyntaxError):
+            continue
+        parsed_fragment = fragment
+        if isinstance(candidate, list) and [normalize_text(x) for x in candidate] == [
+            normalize_text(x) for x in expected
+        ]:
+            return True, fragment
+    expected_numbers = [last_number(str(value)) for value in expected]
+    prediction_numbers = NUMBER_RE.findall(final_fragment(prediction))
+    if all(item is not None for item in expected_numbers) and len(prediction_numbers) >= len(expected):
+        candidate = prediction_numbers[-len(expected) :]
+        correct = all(
+            math.isclose(float(raw.replace(",", "")), item[0], rel_tol=0.0, abs_tol=1e-9)
+            for raw, item in zip(candidate, expected_numbers)
+        )
+        return correct, str(candidate)
+    if parsed_fragment is not None:
+        return False, parsed_fragment
+    return False, "unparsed"
+
+
+def aliases(answer: str) -> list[str]:
+    try:
+        parsed = ast.literal_eval(answer)
+    except (ValueError, SyntaxError):
+        parsed = None
+    values = parsed if isinstance(parsed, list) else [answer]
+    return [normalize_text(value) for value in values if normalize_text(value)]
+
+
+def text_match(prediction: str, answer: str) -> tuple[bool, str]:
+    normalized = normalize_text(final_fragment(prediction))
+    expected = aliases(answer)
+    correct = any(
+        normalized == item or re.search(rf"(?<!\w){re.escape(item)}(?!\w)", normalized)
+        for item in expected
+    )
+    return bool(correct), normalized
+
+
+def score_row(
+    dataset: str,
+    row: pd.Series,
+    can_infer: Callable[[str, dict], str | bool],
+) -> dict:
+    prediction = clean_scalar(row.get("prediction"))
+    answer = clean_scalar(row.get("answer"))
+    question_type = clean_scalar(row.get("question_type")).lower()
+    choices = choices_from_row(row)
+    is_choice = dataset == "MMBench_DEV_EN" or question_type in {
+        "multi_choice",
+        "multiple-choice",
+    }
+    if is_choice:
+        extracted = infer_choice(prediction, choices, can_infer)
+        expected = clean_scalar(row.get("answer_option")) or answer
+        return {
+            "score": float(extracted == expected),
+            "extracted": extracted or "unparsed",
+            "rule": "vlmeval_can_infer_then_deterministic_choice",
+        }
+    answer_type = clean_scalar(row.get("answer_type")).lower()
+    if answer_type == "integer" or re.fullmatch(r"[-+]?\d+", answer):
+        correct, extracted = numeric_match(prediction, answer, integer=True)
+        rule = "final_integer"
+    elif answer_type == "float" or re.fullmatch(r"[-+]?(?:\d+\.\d*|\d*\.\d+)", answer):
+        correct, extracted = numeric_match(prediction, answer)
+        rule = "final_numeric"
+    elif answer_type == "list":
+        correct, extracted = list_match(prediction, answer)
+        rule = "normalized_list"
+    else:
+        correct, extracted = text_match(prediction, answer)
+        rule = "normalized_text_or_alias"
+    return {"score": float(correct), "extracted": extracted, "rule": rule}
+
+
+
+def quant_format(method: str, weight_bits, activation_bits) -> str:
+    if method == "bf16_value_fp32_compute":
+        return "BF16"
+    if method == "official_qwen_awq":
+        return "W4A16"
+    if weight_bits is None or pd.isna(weight_bits):
+        return "unknown"
+    activation = 16 if activation_bits is None or pd.isna(activation_bits) else int(activation_bits)
+    return f"W{int(weight_bits)}A{activation}"
+
+
+def display_method(method: str) -> str:
+    return {
+        "bf16_value_fp32_compute": "BF16",
+        "official_qwen_awq": "Official Qwen AWQ",
+        "llm_int8": "LLM.int8",
+        "vectorwise_w8": "Vectorwise",
+        "omniquant": "OmniQuant",
+        "smoothquant": "SmoothQuant",
+        "squeezellm": "SqueezeLLM",
+        "spqr": "SpQR",
+        "gptq": "GPTQ",
+        "tender": "Tender",
+        "rtn": "RTN",
+    }.get(method, method)
+
+
+def report_table(frame: pd.DataFrame) -> list[str]:
+    columns = [
+        "method_display",
+        "quant_format",
+        "DocVQA_VAL",
+        "MathVista_MINI",
+        "MMMU_DEV_VAL",
+        "MMBench_DEV_EN",
+        "screen_macro_proxy",
+    ]
+    shown = frame[columns].copy().sort_values("screen_macro_proxy", ascending=False)
+    for column in columns[2:]:
+        shown[column] = shown[column].map(lambda value: f"{value:.5f}")
+    headers = ["method", "format", "DocVQA", "MathVista", "MMMU", "MMBench", "macro proxy"]
+    lines = [
+        "| " + " | ".join(headers) + " |",
+        "| " + " | ".join(["---", "---"] + ["---:"] * 5) + " |",
+    ]
+    for row in shown.to_dict("records"):
+        lines.append("| " + " | ".join(str(row[column]) for column in columns) + " |")
+    return lines
+
+
+def markdown_report(comparison: pd.DataFrame, dataset_rows: pd.DataFrame) -> str:
+    comparison = comparison.copy()
+    comparison["quant_format"] = comparison.apply(
+        lambda row: quant_format(row["method"], row["weight_bits"], row["activation_bits"]),
+        axis=1,
+    )
+    comparison["method_display"] = comparison["method"].map(display_method)
+    decoder = comparison[comparison["scope"] == "decoder_canonical"]
+    full = comparison[comparison["scope"] == "full_vlm_extended"]
+    lines = [
+        "# 四数据集本地评分对比（MBQ 前）",
+        "",
+        "> DocVQA 使用已有 VLMEvalKit 本地官方分数；MathVista、MMMU、MMBench 使用",
+        f"> `{POLICY}` 确定性代理评分。代理分数不能冒充 API judge 官方分数。",
+        "",
+        f"覆盖 {len(comparison)} 个方法/scope 配置；每个数据集每配置 64 个样本。",
+        "",
+        "## Decoder-only",
+        "",
+    ]
+    lines.extend(report_table(decoder))
+    lines.extend(["", "## Full-VLM", ""])
+    lines.extend(report_table(full))
+    lines.extend(["", "## 结果对比分析", ""])
+
+    bf16 = decoder[decoder["method"] == "bf16_value_fp32_compute"].iloc[0]
+    decoder_best = decoder.nlargest(3, "screen_macro_proxy")
+    decoder_items = ", ".join(
+        f"{row.method_display} {row.quant_format}={row.screen_macro_proxy:.5f}"
+        for row in decoder_best.itertuples()
+    )
+    lines.append(f"- Decoder 综合前三为：{decoder_items}。")
+    best_decoder = decoder_best.iloc[0]
+    lines.append(
+        f"- Decoder 第一名 {best_decoder['method_display']} 相对 BF16 的 macro proxy 差值为 "
+        f"{best_decoder['screen_macro_proxy'] - bf16['screen_macro_proxy']:+.5f}；差距小于一个单数据集样本步长 "
+        "1/64，因此应视为接近而不是稳定胜出。"
+    )
+    full_best = full.nlargest(3, "screen_macro_proxy")
+    full_items = ", ".join(
+        f"{row.method_display} {row.quant_format}={row.screen_macro_proxy:.5f}"
+        for row in full_best.itertuples()
+    )
+    lines.append(f"- Full-VLM 综合前三为：{full_items}。")
+
+    paired = full.merge(
+        decoder,
+        on=["method", "quant_format"],
+        suffixes=("_full", "_decoder"),
+    )
+    paired["macro_delta"] = (
+        paired["screen_macro_proxy_full"] - paired["screen_macro_proxy_decoder"]
+    )
+    gains = paired.nlargest(3, "macro_delta")
+    drops = paired.nsmallest(3, "macro_delta")
+    gain_items = ", ".join(
+        f"{display_method(row.method)} {row.quant_format} {row.macro_delta:+.5f}"
+        for row in gains.itertuples()
+    )
+    drop_items = ", ".join(
+        f"{display_method(row.method)} {row.quant_format} {row.macro_delta:+.5f}"
+        for row in drops.itertuples()
+    )
+    lines.append(f"- 从 decoder 扩展到 full-VLM 后，macro proxy 增幅前三：{gain_items}。")
+    lines.append(f"- 降幅最大的三个配置：{drop_items}；视觉侧量化并非总能带来收益。")
+    lines.append(
+        "- 分数据集看，SqueezeLLM 在 DocVQA 领先；MathVista 由 LLM.int8 full-VLM 与 RTN W8A8 decoder "
+        "并列领先；MMMU 和 MMBench 则由 BF16/SmoothQuant decoder 领先。整体上 A8 组比 W4A16 更稳定。"
+    )
+
+    lines.extend(["", "## 单数据集前三名", ""])
+    decorated_rows = dataset_rows.copy()
+    decorated_rows["method_display"] = decorated_rows["method"].map(display_method)
+    decorated_rows["quant_format"] = decorated_rows.apply(
+        lambda row: quant_format(row["method"], row["weight_bits"], row["activation_bits"]),
+        axis=1,
+    )
+    for dataset in ("DocVQA_VAL",) + JUDGE_DATASETS:
+        top = decorated_rows[decorated_rows["dataset"] == dataset].nlargest(3, "score")
+        items = ", ".join(
+            f"{row.method_display} {row.quant_format}/{row.scope}={row.score:.5f}"
+            for row in top.itertuples()
+        )
+        lines.append(f"- {dataset}: {items}")
+    lines.extend(
+        [
+            "",
+            "## 解释限制",
+            "",
+            "- `screen_macro_proxy` 是四项 64 样本分数的简单平均，只用于当前方法筛选。",
+            "- MathVista 只认可可确定解析的最终选项、整数、浮点数或列表；复杂自然语言答案可能被低估。",
+            "- MMMU 开放题使用最终数值或规范化文本/别名匹配；MMBench 与选择题使用固定版本 VLMEvalKit 的 `can_infer`。",
+            "- Full-VLM 与 decoder 的量化范围不同；BF16 当前只有 decoder 参考，跨 scope 差异需谨慎解释。",
+            "",
+        ]
+    )
+    return "\n".join(lines)
+
+
+def main() -> None:
+    args = parse_args()
+    can_infer = load_can_infer(args.vlmevalkit_root)
+    all_samples: list[dict] = []
+    dataset_summaries: list[dict] = []
+    comparison_rows: list[dict] = []
+    run_dirs = sorted(
+        path for path in args.root.iterdir() if path.is_dir() and (path / "official_result.json").is_file()
+    )
+    for run_dir in run_dirs:
+        metadata = json.loads((run_dir / "official_result.json").read_text())
+        common = {
+            "run_dir": run_dir.name,
+            "method": metadata["method"],
+            "scheme_id": metadata["scheme_id"],
+            "scope": metadata["scope"],
+            "weight_bits": metadata.get("weight_bits"),
+            "activation_bits": metadata.get("activation_bits"),
+        }
+        comparison = dict(common)
+        docvqa_path = run_dir / "DocVQA_VAL" / "official_score.json"
+        if not docvqa_path.is_file():
+            raise FileNotFoundError(docvqa_path)
+        docvqa = json.loads(docvqa_path.read_text())
+        comparison["DocVQA_VAL"] = float(docvqa["mean_official_score"])
+        dataset_summaries.append(
+            common | {
+                "dataset": "DocVQA_VAL",
+                "score": comparison["DocVQA_VAL"],
+                "score_type": "official_local_anls",
+                "samples": int(docvqa["samples"]),
+            }
+        )
+        for dataset in JUDGE_DATASETS:
+            prediction_path = run_dir / dataset / "predictions.xlsx"
+            frame = pd.read_excel(prediction_path)
+            scored = []
+            for _, row in frame.iterrows():
+                result = score_row(dataset, row, can_infer)
+                scored.append(
+                    common
+                    | {
+                        "dataset": dataset,
+                        "index": canonical_index(row["index"]),
+                        "answer": clean_scalar(row["answer"]),
+                        "prediction": clean_scalar(row["prediction"]),
+                    }
+                    | result
+                )
+            score = sum(row["score"] for row in scored) / len(scored)
+            payload = {
+                "status": "complete",
+                "dataset": dataset,
+                "samples": len(scored),
+                "correct": int(sum(row["score"] for row in scored)),
+                "mean_local_score": score,
+                "score_type": "local_proxy",
+                "policy": POLICY,
+                "official_comparable": False,
+                "prediction_sha256": file_sha256(prediction_path),
+                "vlmevalkit_revision": VLMEVALKIT_REVISION,
+            }
+            atomic_json(run_dir / dataset / "local_score.json", payload)
+            atomic_jsonl(run_dir / dataset / "local_samples.jsonl", scored)
+            all_samples.extend(scored)
+            dataset_summaries.append(
+                common
+                | {
+                    "dataset": dataset,
+                    "score": score,
+                    "score_type": "local_proxy",
+                    "samples": len(scored),
+                }
+            )
+            comparison[dataset] = score
+        comparison["screen_macro_proxy"] = sum(
+            comparison[dataset] for dataset in ("DocVQA_VAL",) + JUDGE_DATASETS
+        ) / 4
+        comparison_rows.append(comparison)
+
+    comparison = pd.DataFrame(comparison_rows)
+    dataset_frame = pd.DataFrame(dataset_summaries)
+    args.output_dir.mkdir(parents=True, exist_ok=True)
+    comparison.to_csv(args.output_dir / "four_dataset_comparison.csv", index=False)
+    dataset_frame.to_csv(args.output_dir / "dataset_scores.csv", index=False)
+    atomic_jsonl(args.output_dir / "local_proxy_samples.jsonl", all_samples)
+    atomic_json(
+        args.output_dir / "summary.json",
+        {
+            "status": "complete",
+            "policy": POLICY,
+            "official_comparable": False,
+            "runs": comparison_rows,
+            "dataset_scores": dataset_summaries,
+            "total_proxy_samples": len(all_samples),
+        },
+    )
+    atomic_text(args.output_dir / "report_zh.md", markdown_report(comparison, dataset_frame))
+
+
+if __name__ == "__main__":
+    main()

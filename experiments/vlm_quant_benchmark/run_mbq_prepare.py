@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import argparse
+import time
 from pathlib import Path
 
 import torch
@@ -9,9 +10,12 @@ import torch
 from .config import ExperimentConfig, ImplementationTier, MethodName, QuantScope
 from .data import load_manifest, sample_manifest_digest
 from .mbq import (
-    collect_mbq_search_cached,
+    collect_mbq_statistics,
+    load_mbq_search,
     mbq_cache_key,
     mbq_calibration_batches,
+    save_mbq_search,
+    search_mbq_scales,
 )
 from .provenance import completed_run, mark_complete, source_digest
 from .reporting import atomic_json
@@ -24,7 +28,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--model-path", required=True)
     parser.add_argument("--calibration-manifest", type=Path, required=True)
     parser.add_argument("--output-dir", type=Path, required=True)
-    parser.add_argument("--schemes", default="w4a16,w4a8")
+    parser.add_argument("--calibration-cache-dir", type=Path)
+    parser.add_argument("--schemes", default="w3a16,w4a16")
     parser.add_argument("--preset", choices=("probe", "smoke", "full"), default="probe")
     parser.add_argument("--threads", type=int, default=16)
     parser.add_argument("--seed", type=int, default=42)
@@ -38,24 +43,26 @@ def scheme_config(scheme: str, *, samples: int, seed: int, probe: bool) -> Exper
     common = {
         "method": MethodName.MBQ,
         "scope": QuantScope.DECODER_CANONICAL,
-        "weight_bits": 4,
         "calibration_samples": samples,
         "calibration_protocol": "multimodal_train_4x32",
         "implementation_tier": ImplementationTier.LOCAL_VALIDATED,
         "seed": seed,
         "mbq_scale_grid": (0.0, 0.5) if probe else tuple(i / 20 for i in range(20)),
     }
-    if scheme == "w4a16":
+    if scheme in {"w3a16", "w4a16"}:
+        bits = 3 if scheme == "w3a16" else 4
         return ExperimentConfig(
+            weight_bits=bits,
             activation_bits=None,
             zero_point=True,
             group_size=128,
             weight_granularity="groupwise",
-            scheme_id="mbq_w4a16_g128_asym",
+            scheme_id=f"mbq_w{bits}a16_g128_asym",
             **common,
         )
     if scheme == "w4a8":
         return ExperimentConfig(
+            weight_bits=4,
             activation_bits=8,
             zero_point=False,
             group_size=128,
@@ -78,8 +85,8 @@ def main() -> None:
     torch.set_num_threads(args.threads)
     torch.manual_seed(args.seed)
     schemes = [value.strip() for value in args.schemes.split(",") if value.strip()]
-    if not schemes or set(schemes) - {"w4a16", "w4a8"}:
-        raise ValueError("--schemes must contain w4a16 and/or w4a8")
+    if not schemes or set(schemes) - {"w3a16", "w4a16", "w4a8"}:
+        raise ValueError("--schemes must contain w3a16, w4a16, and/or w4a8")
     sample_count = {"probe": 1, "smoke": 2, "full": 128}[args.preset]
     calibration = load_manifest(args.calibration_manifest)
     if len(calibration) < sample_count:
@@ -132,8 +139,10 @@ def main() -> None:
         strict_qwen_3b=not args.allow_nonstandard_model,
     )
     selected = _first_decoder_block(all_selected) if args.preset == "probe" else all_selected
-    cache_dir = args.output_dir / "_mbq_cache"
+    cache_dir = args.calibration_cache_dir or args.output_dir / "_mbq_cache"
     try:
+        shared_statistics = None
+        shared_statistics_seconds = 0.0
         for config in pending:
             destination = args.output_dir / config.scheme_id
             destination.mkdir(parents=True, exist_ok=True)
@@ -151,21 +160,35 @@ def main() -> None:
                 reservoir_rows=32,
                 attention_implementation="sdpa",
             )
-            result, cache_hit = collect_mbq_search_cached(
-                model,
-                selected,
-                mbq_calibration_batches(
-                    processor,
-                    calibration,
-                    min_pixels=config.min_pixels,
-                    max_pixels=config.max_pixels,
-                ),
-                config,
-                cache_dir=cache_dir,
-                key=key,
-                reservoir_rows=32,
-                attention_implementation="sdpa",
-            )
+            cache_path = cache_dir / f"mbq_{key}.pt"
+            result = load_mbq_search(cache_path, key=key, selected=selected)
+            cache_hit = result is not None
+            if result is None:
+                if shared_statistics is None:
+                    statistics_started = time.perf_counter()
+                    shared_statistics = collect_mbq_statistics(
+                        model, selected,
+                        mbq_calibration_batches(
+                            processor, calibration,
+                            min_pixels=config.min_pixels,
+                            max_pixels=config.max_pixels,
+                        ),
+                        reservoir_rows=32,
+                        seed=config.seed,
+                        attention_implementation="sdpa",
+                    )
+                    shared_statistics_seconds = time.perf_counter() - statistics_started
+                stats, ratios, token_counts = shared_statistics
+                search_started = time.perf_counter()
+                result = search_mbq_scales(
+                    selected, stats, ratios, config, token_counts,
+                )
+                result.audit["statistics_seconds"] = shared_statistics_seconds
+                result.audit["scale_search_seconds"] = time.perf_counter() - search_started
+                result.audit["search_seconds"] = (
+                    result.audit["statistics_seconds"] + result.audit["scale_search_seconds"]
+                )
+                save_mbq_search(cache_path, key=key, result=result)
             audit = dict(result.audit)
             audit.update({
                 "cache_key": key,

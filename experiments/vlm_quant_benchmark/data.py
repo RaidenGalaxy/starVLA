@@ -7,6 +7,8 @@ import re
 from dataclasses import asdict, dataclass
 from pathlib import Path
 
+from .dataset_protocol import ACTIVE_DATASET_NAMES, PROTOCOL_VERSION
+
 
 def file_digest(path: Path) -> str:
     digest = hashlib.sha256()
@@ -203,7 +205,8 @@ def write_protocol(path: Path, seed: int = 42) -> None:
         },
         "evaluation": {
             "screen_samples_per_dataset": 64,
-            "vlm": ["DocVQA_VAL", "MathVista_MINI", "MMMU_DEV_VAL", "MMBench_DEV_EN"],
+            "vlm": list(ACTIVE_DATASET_NAMES),
+            "protocol_version": PROTOCOL_VERSION,
             "language": ["wikitext2_test", "ptb_test", "c4_validation_256x2048"],
             "vlmevalkit_revision": "4c4540cb19610b166499d004873674d00c88680f",
         },

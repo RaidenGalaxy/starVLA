@@ -50,11 +50,6 @@ def comparison_configs(args: argparse.Namespace) -> list[ExperimentConfig]:
             implementation_tier=ImplementationTier.NAIVE_BASELINE, **common,
         ),
         ExperimentConfig(
-            MethodName.AWQ, activation_bits=None, zero_point=True,
-            group_size=128, weight_granularity="groupwise",
-            scheme_id="local_awq_w4a16_g128_asym", **common,
-        ),
-        ExperimentConfig(
             MethodName.MBQ, activation_bits=None, zero_point=True,
             group_size=128, weight_granularity="groupwise",
             scheme_id="mbq_w4a16_g128_asym", **common,

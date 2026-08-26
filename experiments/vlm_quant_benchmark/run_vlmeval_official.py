@@ -18,14 +18,22 @@ from time import perf_counter
 
 from .config import MethodName, QuantScope
 from .data import assert_disjoint, file_digest, load_manifest, normalized_question_digest
+from .dataset_protocol import (
+    ACTIVE_DATASET_NAMES,
+    DATASET_SPECS,
+    PROTOCOL_VERSION,
+    docvqa_anls_score,
+    finite_unit_score,
+    textvqa_consensus_score,
+)
 from .provenance import completed_run, file_sha256, mark_complete, sha256_json, source_digest
 from .reporting import atomic_json
 from .runner import environment_record
 
 
 VLMEVALKIT_REVISION = "4c4540cb19610b166499d004873674d00c88680f"
-DATASETS = ("DocVQA_VAL", "MathVista_MINI", "MMMU_DEV_VAL", "MMBench_DEV_EN")
-JUDGE_DATASETS = {"MathVista_MINI", "MMMU_DEV_VAL", "MMBench_DEV_EN"}
+DATASETS = ACTIVE_DATASET_NAMES
+JUDGE_DATASETS: set[str] = set()
 
 
 def parse_args() -> argparse.Namespace:
@@ -38,9 +46,11 @@ def parse_args() -> argparse.Namespace:
                         default="bf16_value_fp32_compute")
     parser.add_argument("--scope", choices=[item.value for item in QuantScope],
                         default="decoder_canonical")
-    parser.add_argument("--weight-bits", type=int, choices=(4, 8))
-    parser.add_argument("--activation-bits", type=int, choices=(4, 8))
+    parser.add_argument("--weight-bits", type=int, choices=(3, 4, 8))
+    parser.add_argument("--activation-bits", type=int, choices=(8,))
     parser.add_argument("--group-size", type=int, default=128)
+    parser.add_argument(
+        "--weight-granularity", choices=("groupwise", "per_output_channel"))
     parser.add_argument("--scheme-id")
     parser.add_argument("--calibration-manifest", type=Path)
     parser.add_argument("--screen-manifest", type=Path)
@@ -53,6 +63,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--threads", type=int, default=16)
     parser.add_argument("--resume", action="store_true")
+    parser.add_argument("--reuse-predictions-from", type=Path)
     parser.add_argument("--allow-nonstandard-model", action="store_true")
     return parser.parse_args()
 
@@ -90,10 +101,19 @@ def canonical_index(value) -> str:
 def selected_data(dataset, name: str, args):
     if args.preset == "full":
         return dataset.data.copy(), []
-    if args.preset == "smoke":
-        return dataset.data.iloc[:1].copy(), []
     if args.screen_manifest is None:
+        if args.preset == "smoke":
+            return dataset.data.iloc[:1].copy(), []
         raise ValueError("--screen-manifest is required for screen")
+    if args.preset == "smoke":
+        manifest = [item for item in load_manifest(args.screen_manifest) if item.dataset == name]
+        if not manifest:
+            raise ValueError(f"{name} is absent from the smoke manifest")
+        wanted = canonical_index(manifest[0].official_index)
+        selected = dataset.data[[canonical_index(value) == wanted for value in dataset.data["index"]]]
+        if len(selected) != 1:
+            raise ValueError(f"{name} smoke index {wanted} is not unique upstream")
+        return selected.copy(), manifest[:1]
     manifest = [item for item in load_manifest(args.screen_manifest) if item.dataset == name]
     if len(manifest) != 64:
         raise ValueError(f"{name} fixed manifest requires exactly 64 rows")
@@ -168,16 +188,23 @@ def extract_scores(
         if "index" not in columns:
             continue
         candidate = {}
-        if dataset_name == "MathVista_MINI" and {"res", "log"} <= set(columns):
-            from vlmeval.dataset.utils.mathvista import post_check
+        if dataset_name == "DocVQA_VAL":
+            if not {"answer", "prediction"} <= set(columns):
+                continue
             for _, row in frame.iterrows():
-                candidate[canonical_index(row[columns["index"]])] = float(
-                    bool(post_check(row, prefetch=False))
+                candidate[canonical_index(row[columns["index"]])] = docvqa_anls_score(
+                    row[columns["answer"]], row[columns["prediction"]],
+                )
+        elif dataset_name == "TextVQA_VAL":
+            if not {"answer", "prediction"} <= set(columns):
+                continue
+            for _, row in frame.iterrows():
+                candidate[canonical_index(row[columns["index"]])] = textvqa_consensus_score(
+                    row[columns["answer"]], row[columns["prediction"]],
                 )
         else:
             preferred = (
-                ("eval_score",) if dataset_name == "DocVQA_VAL" else
-                ("hit",) if dataset_name in {"MMMU_DEV_VAL", "MMBench_DEV_EN"} else
+                ("hit",) if dataset_name in {"MMMU_DEV_VAL", "ScienceQA_TEST"} else
                 ("official_score", "hit", "eval_score", "score", "anls", "correct", "match")
             )
             score_column = next(
@@ -186,7 +213,7 @@ def extract_scores(
             if score_column is None:
                 continue
             for _, row in frame.iterrows():
-                score = score_value(row[score_column])
+                score = finite_unit_score(row[score_column])
                 if score is not None:
                     candidate[canonical_index(row[columns["index"]])] = score
         if all(index in candidate for index in indices):
@@ -231,6 +258,10 @@ def scorer_hash(dataset) -> str:
         "fixed_judge_policy_sha256": hashlib.sha256(
             inspect.getsource(mathvista_auxeval_fixed).encode()
         ).hexdigest(),
+        "score_extraction_sha256": hashlib.sha256(
+            inspect.getsource(extract_scores).encode()
+        ).hexdigest(),
+        "protocol_version": PROTOCOL_VERSION,
     }
     if dataset.dataset_name == "MathVista_MINI":
         import vlmeval.dataset.utils.mathvista as mathvista
@@ -285,6 +316,11 @@ def main() -> None:
     if set(datasets) - set(DATASETS):
         raise ValueError(f"datasets must be a subset of {DATASETS}")
     method, scope = MethodName(args.method), QuantScope(args.scope)
+    weight_granularity = args.weight_granularity or (
+        "per_output_channel"
+        if method == MethodName.MBQ and args.activation_bits == 8
+        else "groupwise"
+    )
     scheme = args.scheme_id or (
         "official_w4a16_g128_asym"
         if args.official_awq_path
@@ -299,13 +335,16 @@ def main() -> None:
         "weight_bits": args.weight_bits,
         "activation_bits": args.activation_bits,
         "group_size": args.group_size,
+        "weight_granularity": weight_granularity,
+        "zero_point": args.weight_bits is not None and args.activation_bits is None,
         "preset": args.preset,
         "datasets": datasets,
         "seed": args.seed,
         "min_pixels": 256 * 28 * 28,
         "max_pixels": 1280 * 28 * 28,
         "vlmevalkit_revision": VLMEVALKIT_REVISION,
-        "judge": {"model": args.judge_model, "temperature": 0, "nproc": 4, "retry": 3},
+        "judge": None,
+        "protocol_version": PROTOCOL_VERSION,
     }
     config_digest = sha256_json(config)
     digests = {
@@ -353,6 +392,48 @@ def main() -> None:
             generated = read_jsonl(progress_path)
         else:
             generated = []
+        if not generated and args.reuse_predictions_from is not None:
+            donor_config_path = args.reuse_predictions_from / "config.json"
+            donor_path = (
+                args.reuse_predictions_from / dataset_name / "generations.partial.jsonl"
+            )
+            if donor_config_path.is_file() and donor_path.is_file():
+                donor_config = json.loads(donor_config_path.read_text())
+                comparable = (
+                    "method", "scope", "weight_bits", "activation_bits", "group_size",
+                    "zero_point", "weight_granularity",
+                )
+                def comparable_value(payload, key):
+                    value = payload.get(key)
+                    if key == "weight_granularity" and value is None:
+                        return "groupwise"
+                    if key == "zero_point" and value is None:
+                        return (
+                            payload.get("weight_bits") is not None
+                            and payload.get("activation_bits") is None
+                        )
+                    return value
+
+                mismatch = [
+                    key for key in comparable
+                    if comparable_value(donor_config, key) != comparable_value(config, key)
+                ]
+                if mismatch:
+                    raise ValueError(
+                        f"prediction donor config mismatch for {mismatch}: "
+                        f"{args.reuse_predictions_from}"
+                    )
+                expected_rows = {
+                    canonical_index(line["index"]): sha256_json({
+                        str(key): str(value) for key, value in line.to_dict().items()
+                    })
+                    for _, line in data.iterrows()
+                }
+                generated = [
+                    row for row in read_jsonl(donor_path)
+                    if row.get("index") in expected_rows
+                    and row.get("dataset_row_sha256") == expected_rows[row["index"]]
+                ]
         by_index = {row["index"]: row for row in generated}
         if len(by_index) != len(generated):
             raise ValueError(f"duplicate generation index: {dataset_name}")
@@ -391,8 +472,11 @@ def main() -> None:
             strict_qwen_3b=not args.allow_nonstandard_model,
             official_awq_path=args.official_awq_path,
             calibration_cache_dir=str(args.output_dir.parent / "_calibration_cache"),
+            model_revision_digest=digests["base_model"],
             calibration_samples=2 if args.preset == "smoke" else 128,
+            omniquant_steps=2 if args.preset == "smoke" else 20,
             scheme_id=scheme,
+            weight_granularity=weight_granularity,
         )
         audit = (
             model.official_awq_audit if args.official_awq_path else model.applied.audit
@@ -507,6 +591,10 @@ def main() -> None:
             scored = [
                 row | {
                     "official_score": scores[row["index"]],
+                    **(
+                        {"anls_score": scores[row["index"]]}
+                        if dataset_name == "DocVQA_VAL" else {}
+                    ),
                     "judge_cache_key": key,
                     "scoring_prompt_hash": prompt_hash,
                 }
@@ -519,6 +607,11 @@ def main() -> None:
                 "dataset": dataset_name,
                 "samples": len(scored),
                 "mean_official_score": sum(scores.values()) / len(scores),
+                "score": 100.0 * sum(scores.values()) / len(scores),
+                "metric": DATASET_SPECS[dataset_name].metric,
+                "scale": "0_100",
+                "max_score": DATASET_SPECS[dataset_name].max_score,
+                "higher_is_better": DATASET_SPECS[dataset_name].higher_is_better,
                 "cache_hit": cache_hit,
                 "elapsed_seconds": perf_counter() - dataset_started,
                 "generation_seconds_p95": sorted(
@@ -541,6 +634,7 @@ def main() -> None:
             "scope": scope.value,
             "weight_bits": args.weight_bits,
             "activation_bits": args.activation_bits,
+            "weight_granularity": weight_granularity,
             "implementation_tier": (
                 "official_anchor" if args.official_awq_path else
                 "reference" if method == MethodName.BF16_VALUE_FP32_COMPUTE else

@@ -1,0 +1,208 @@
+"""Prepare reusable MBQ scale artifacts without running quality evaluation."""
+from __future__ import annotations
+
+import argparse
+import time
+from pathlib import Path
+
+import torch
+
+from .config import ExperimentConfig, ImplementationTier, MethodName, QuantScope
+from .data import load_manifest, sample_manifest_digest
+from .mbq import (
+    collect_mbq_statistics,
+    load_mbq_search,
+    mbq_cache_key,
+    mbq_calibration_batches,
+    save_mbq_search,
+    search_mbq_scales,
+)
+from .provenance import completed_run, mark_complete, source_digest
+from .reporting import atomic_json
+from .runner import environment_record, load_reference
+from .selection import inventory, select_linears
+
+
+def parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(description="Prepare Qwen2.5-VL MBQ search artifacts")
+    parser.add_argument("--model-path", required=True)
+    parser.add_argument("--calibration-manifest", type=Path, required=True)
+    parser.add_argument("--output-dir", type=Path, required=True)
+    parser.add_argument("--calibration-cache-dir", type=Path)
+    parser.add_argument("--schemes", default="w4a16,w4a8")
+    parser.add_argument("--preset", choices=("probe", "smoke", "full"), default="probe")
+    parser.add_argument("--threads", type=int, default=16)
+    parser.add_argument("--seed", type=int, default=42)
+    parser.add_argument("--resume", action="store_true")
+    parser.add_argument("--dry-run", action="store_true")
+    parser.add_argument("--allow-nonstandard-model", action="store_true")
+    return parser.parse_args()
+
+
+def scheme_config(scheme: str, *, samples: int, seed: int, probe: bool) -> ExperimentConfig:
+    common = {
+        "method": MethodName.MBQ,
+        "scope": QuantScope.DECODER_CANONICAL,
+        "weight_bits": 4,
+        "calibration_samples": samples,
+        "calibration_protocol": "multimodal_train_4x32",
+        "implementation_tier": ImplementationTier.LOCAL_VALIDATED,
+        "seed": seed,
+        "mbq_scale_grid": (0.0, 0.5) if probe else tuple(i / 20 for i in range(20)),
+    }
+    if scheme == "w4a16":
+        return ExperimentConfig(
+            activation_bits=None,
+            zero_point=True,
+            group_size=128,
+            weight_granularity="groupwise",
+            scheme_id="mbq_w4a16_g128_asym",
+            **common,
+        )
+    if scheme == "w4a8":
+        return ExperimentConfig(
+            activation_bits=8,
+            zero_point=False,
+            group_size=128,
+            weight_granularity="per_output_channel",
+            scheme_id="mbq_w4a8_perchannel_sym",
+            **common,
+        )
+    raise ValueError(f"unsupported MBQ scheme: {scheme}")
+
+
+def _first_decoder_block(selected):
+    layer_zero = [item for item in selected if ".layers.0." in item.name]
+    if len(layer_zero) != 7:
+        raise RuntimeError(f"MBQ probe expected 7 projections in layer 0, got {len(layer_zero)}")
+    return layer_zero
+
+
+def main() -> None:
+    args = parse_args()
+    torch.set_num_threads(args.threads)
+    torch.manual_seed(args.seed)
+    schemes = [value.strip() for value in args.schemes.split(",") if value.strip()]
+    if not schemes or set(schemes) - {"w4a16", "w4a8"}:
+        raise ValueError("--schemes must contain w4a16 and/or w4a8")
+    sample_count = {"probe": 1, "smoke": 2, "full": 128}[args.preset]
+    calibration = load_manifest(args.calibration_manifest)
+    if len(calibration) < sample_count:
+        raise ValueError(
+            f"MBQ {args.preset} requires {sample_count} calibration samples, got {len(calibration)}"
+        )
+    calibration = calibration[:sample_count]
+    input_digests = {
+        "model": source_digest(args.model_path),
+        "calibration_manifest": source_digest(args.calibration_manifest),
+        "calibration_subset": sample_manifest_digest(calibration),
+        "preset": args.preset,
+    }
+    args.output_dir.mkdir(parents=True, exist_ok=True)
+    configs = [
+        scheme_config(
+            scheme, samples=sample_count, seed=args.seed, probe=args.preset == "probe",
+        )
+        for scheme in schemes
+    ]
+    atomic_json(args.output_dir / "prepare_plan.json", {
+        "preset": args.preset,
+        "partial_not_evaluable": args.preset == "probe",
+        "input_digests": input_digests,
+        "configs": [config.to_dict() | {"config_hash": config.digest} for config in configs],
+        "environment": environment_record(),
+    })
+    if args.dry_run:
+        return
+
+    required = ("search_audit.json", "module_inventory.json", "config.json")
+    pending = []
+    for config in configs:
+        destination = args.output_dir / config.scheme_id
+        if args.resume and completed_run(
+            destination,
+            config_digest=config.digest,
+            input_digests=input_digests,
+            required_artifacts=required,
+        ):
+            continue
+        pending.append(config)
+    if not pending:
+        return
+
+    model, processor, conversion = load_reference(args.model_path)
+    all_selected = select_linears(
+        model,
+        QuantScope.DECODER_CANONICAL,
+        strict_qwen_3b=not args.allow_nonstandard_model,
+    )
+    selected = _first_decoder_block(all_selected) if args.preset == "probe" else all_selected
+    cache_dir = args.calibration_cache_dir or args.output_dir / "_mbq_cache"
+    try:
+        shared_statistics = None
+        shared_statistics_seconds = 0.0
+        for config in pending:
+            destination = args.output_dir / config.scheme_id
+            destination.mkdir(parents=True, exist_ok=True)
+            atomic_json(destination / "config.json", config.to_dict() | {
+                "config_hash": config.digest,
+                "input_digests": input_digests,
+                "reference_conversion": conversion,
+            })
+            atomic_json(destination / "module_inventory.json", inventory(selected))
+            key = mbq_cache_key(
+                model_revision=input_digests["model"],
+                calibration_digest=input_digests["calibration_subset"],
+                selected_names=[item.name for item in selected],
+                config=config,
+                reservoir_rows=32,
+                attention_implementation="sdpa",
+            )
+            cache_path = cache_dir / f"mbq_{key}.pt"
+            result = load_mbq_search(cache_path, key=key, selected=selected)
+            cache_hit = result is not None
+            if result is None:
+                if shared_statistics is None:
+                    statistics_started = time.perf_counter()
+                    shared_statistics = collect_mbq_statistics(
+                        model, selected,
+                        mbq_calibration_batches(
+                            processor, calibration,
+                            min_pixels=config.min_pixels,
+                            max_pixels=config.max_pixels,
+                        ),
+                        reservoir_rows=32,
+                        seed=config.seed,
+                        attention_implementation="sdpa",
+                    )
+                    shared_statistics_seconds = time.perf_counter() - statistics_started
+                stats, ratios, token_counts = shared_statistics
+                search_started = time.perf_counter()
+                result = search_mbq_scales(
+                    selected, stats, ratios, config, token_counts,
+                )
+                result.audit["statistics_seconds"] = shared_statistics_seconds
+                result.audit["scale_search_seconds"] = time.perf_counter() - search_started
+                result.audit["search_seconds"] = (
+                    result.audit["statistics_seconds"] + result.audit["scale_search_seconds"]
+            audit = dict(result.audit)
+            audit.update({
+                "cache_key": key,
+                "cache_hit": cache_hit,
+                "status": "partial_not_evaluable" if args.preset == "probe" else "ready",
+                "selected_module_count": len(selected),
+                "expected_evaluation_module_count": 252,
+            })
+            atomic_json(destination / "search_audit.json", audit)
+            mark_complete(
+                destination,
+                config_digest=config.digest,
+                input_digests=input_digests,
+                required_artifacts=required,
+            )
+    finally:
+        del model, processor
+
+
+if __name__ == "__main__":
+    main()

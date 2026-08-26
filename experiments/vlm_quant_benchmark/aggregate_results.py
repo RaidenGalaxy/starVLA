@@ -9,6 +9,15 @@ from .result_analysis import select_best_local_w4, summarize_candidate
 
 
 W4_TIERS = {"local_algorithm_simulation", "cpu_research_approximation"}
+ALLOWED_ACTIVATION_BITS = {None, 8}
+EXCLUDED_SCHEME_PREFIXES = ("local_awq",)
+
+
+def included_by_active_policy(value: dict) -> bool:
+    return (
+        value.get("activation_bits") in ALLOWED_ACTIVATION_BITS
+        and not str(value.get("scheme_id", "")).startswith(EXCLUDED_SCHEME_PREFIXES)
+    )
 
 
 def read_json(path: Path) -> dict:
@@ -31,6 +40,8 @@ def corpus_rows(root: Path) -> list[dict]:
     for path, corpora in results(root, "corpus_metrics.json"):
         config_path = path.parent / "config.json"
         config = read_json(config_path) if config_path.is_file() else {}
+        if not included_by_active_policy(config):
+            continue
         for corpus, metric in corpora.items():
             paired = metric.get("paired_vs_bf16", {})
             interval = paired.get("bootstrap_95_ci", [None, None])
@@ -40,6 +51,8 @@ def corpus_rows(root: Path) -> list[dict]:
                 "scheme_id": config.get("scheme_id"),
                 "scope": config.get("scope"),
                 "implementation_tier": config.get("implementation_tier"),
+                "activation_bits": config.get("activation_bits"),
+                "weight_granularity": config.get("weight_granularity"),
                 "corpus": corpus,
                 "tokens": metric.get("tokens"),
                 "windows": metric.get("windows"),
@@ -57,6 +70,8 @@ def corpus_rows(root: Path) -> list[dict]:
 def split_official(root: Path):
     screen, full = [], []
     for path, result in results(root, "official_result.json"):
+        if not included_by_active_policy(result):
+            continue
         relative = path.relative_to(root)
         if "vlm_screen" in relative.parts:
             screen.append((path, result))
@@ -90,6 +105,8 @@ def screen_rows(runs: list[tuple[Path, dict]]):
                 "scheme_id": result.get("scheme_id"),
                 "scope": result.get("scope"),
                 "implementation_tier": result.get("implementation_tier"),
+                "activation_bits": result.get("activation_bits"),
+                "weight_granularity": result.get("weight_granularity"),
                 "dataset": dataset,
                 "samples": score.get("samples"),
                 "official_score": score.get("mean_official_score"),
@@ -151,6 +168,8 @@ def resource_rows(root: Path) -> list[dict]:
         config = read_json(config_path) if config_path.is_file() else {}
         if isinstance(config.get("config"), dict):
             config = config["config"] | config
+        if not included_by_active_policy(config):
+            continue
         official = audit.get("kind") == "official_qwen_awq_cpu_dequantized_quality_anchor"
         rows.append({
             "run": str(path.parent.relative_to(root)),
@@ -214,13 +233,15 @@ def report_text(corpus, screen, full, tiers, resources, selection) -> str:
         "## Corpus PPL",
         "",
         table(corpus, [
-            "method", "scheme_id", "corpus", "ppl", "paired_nll_delta",
+            "method", "scheme_id", "activation_bits", "weight_granularity",
+            "corpus", "ppl", "paired_nll_delta",
             "paired_ci_lower", "paired_ci_upper", "paired_conclusion",
         ]),
         "## VLM screen",
         "",
         table(screen, [
-            "method", "scheme_id", "scope", "dataset", "official_score",
+            "method", "scheme_id", "scope", "activation_bits", "weight_granularity",
+            "dataset", "official_score",
             "retention_vs_bf16", "paired_ci_lower", "paired_ci_upper",
             "paired_conclusion", "status",
         ]),
@@ -275,7 +296,12 @@ def main() -> None:
         "method_tiers": tiers,
         "resource_audit": resources,
         "best_local_w4": selection,
-        "ranking_excludes": ["target_text_diagnostic", "legacy_conditional_answer_ppl"],
+        "ranking_excludes": [
+            "target_text_diagnostic",
+            "legacy_conditional_answer_ppl",
+            "activation_bits_4",
+            "local_awq",
+        ],
         "actual_memory_or_speed_claims": False,
     })
     destination = args.output_dir / "report.md"

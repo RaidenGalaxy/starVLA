@@ -1,0 +1,312 @@
+from __future__ import annotations
+
+import argparse
+import json
+from pathlib import Path
+
+from .reporting import atomic_json, write_summary
+from .result_analysis import select_best_local_w4, summarize_candidate
+
+
+W4_TIERS = {"local_algorithm_simulation", "cpu_research_approximation"}
+ALLOWED_ACTIVATION_BITS = {None, 8}
+EXCLUDED_SCHEME_PREFIXES = ("local_awq",)
+
+
+def included_by_active_policy(value: dict) -> bool:
+    return (
+        value.get("activation_bits") in ALLOWED_ACTIVATION_BITS
+        and not str(value.get("scheme_id", "")).startswith(EXCLUDED_SCHEME_PREFIXES)
+    )
+
+
+def read_json(path: Path) -> dict:
+    value = json.loads(path.read_text())
+    if not isinstance(value, dict):
+        raise ValueError(f"expected JSON object: {path}")
+    return value
+
+
+def results(root: Path, filename: str) -> list[tuple[Path, dict]]:
+    return [
+        (path, read_json(path))
+        for path in sorted(root.rglob(filename))
+        if ".cache" not in path.parts
+    ]
+
+
+def corpus_rows(root: Path) -> list[dict]:
+    rows = []
+    for path, corpora in results(root, "corpus_metrics.json"):
+        config_path = path.parent / "config.json"
+        config = read_json(config_path) if config_path.is_file() else {}
+        if not included_by_active_policy(config):
+            continue
+        for corpus, metric in corpora.items():
+            paired = metric.get("paired_vs_bf16", {})
+            interval = paired.get("bootstrap_95_ci", [None, None])
+            rows.append({
+                "run": str(path.parent.relative_to(root)),
+                "method": config.get("method"),
+                "scheme_id": config.get("scheme_id"),
+                "scope": config.get("scope"),
+                "implementation_tier": config.get("implementation_tier"),
+                "activation_bits": config.get("activation_bits"),
+                "weight_granularity": config.get("weight_granularity"),
+                "corpus": corpus,
+                "tokens": metric.get("tokens"),
+                "windows": metric.get("windows"),
+                "ppl": metric.get("ppl"),
+                "nll": metric.get("nll"),
+                "paired_nll_delta": paired.get("token_weighted_mean_nll_delta"),
+                "paired_ci_lower": interval[0],
+                "paired_ci_upper": interval[1],
+                "paired_conclusion": paired.get("conclusion"),
+                "elapsed_seconds": metric.get("elapsed_seconds"),
+            })
+    return rows
+
+
+def split_official(root: Path):
+    screen, full = [], []
+    for path, result in results(root, "official_result.json"):
+        if not included_by_active_policy(result):
+            continue
+        relative = path.relative_to(root)
+        if "vlm_screen" in relative.parts:
+            screen.append((path, result))
+        elif "full" in relative.parts:
+            full.append((path, result))
+    return screen, full
+
+
+def screen_rows(runs: list[tuple[Path, dict]]):
+    reference = next(
+        (value for _path, value in runs if value.get("implementation_tier") == "reference"),
+        None,
+    )
+    rows = []
+    for path, result in runs:
+        summary = None
+        if (
+            reference is not None
+            and result.get("implementation_tier") != "reference"
+            and result.get("status") == "complete"
+            and reference.get("status") == "complete"
+        ):
+            summary = summarize_candidate(result["samples"], reference["samples"])
+        for dataset, score in result.get("datasets", {}).items():
+            paired = summary["datasets"].get(dataset, {}) if summary else {}
+            interval = paired.get("bootstrap_95_ci", [None, None])
+            rows.append({
+                "run": str(path.parent),
+                "run_id": result.get("run_id"),
+                "method": result.get("method"),
+                "scheme_id": result.get("scheme_id"),
+                "scope": result.get("scope"),
+                "implementation_tier": result.get("implementation_tier"),
+                "activation_bits": result.get("activation_bits"),
+                "weight_granularity": result.get("weight_granularity"),
+                "dataset": dataset,
+                "samples": score.get("samples"),
+                "official_score": score.get("mean_official_score"),
+                "retention_vs_bf16": paired.get("retention"),
+                "paired_score_delta": paired.get("mean_score_delta"),
+                "paired_ci_lower": interval[0],
+                "paired_ci_upper": interval[1],
+                "paired_conclusion": paired.get("conclusion"),
+                "status": result.get("status"),
+            })
+    return rows, reference
+
+
+def full_rows(runs: list[tuple[Path, dict]]) -> list[dict]:
+    return [
+        {
+            "run": str(path.parent),
+            "run_id": result.get("run_id"),
+            "method": result.get("method"),
+            "scheme_id": result.get("scheme_id"),
+            "scope": result.get("scope"),
+            "implementation_tier": result.get("implementation_tier"),
+            "dataset": dataset,
+            "samples": score.get("samples"),
+            "official_score": score.get("mean_official_score"),
+            "status": result.get("status"),
+        }
+        for path, result in runs
+        for dataset, score in result.get("datasets", {}).items()
+    ]
+
+
+def tier_rows(runs: list[tuple[Path, dict]]) -> list[dict]:
+    claims = {
+        "reference": "BF16 values widened to FP32 CPU compute",
+        "official_anchor": "Qwen official AWQ CPU-dequantized quality anchor",
+        "local_algorithm_simulation": "validated local algorithm simulation",
+        "cpu_research_approximation": "second-wave CPU research approximation",
+        "naive_baseline": "matched naive baseline",
+    }
+    return [
+        {
+            "run": str(path.parent),
+            "run_id": value.get("run_id"),
+            "method": value.get("method"),
+            "scheme_id": value.get("scheme_id"),
+            "scope": value.get("scope"),
+            "implementation_tier": value.get("implementation_tier"),
+            "claim": claims.get(value.get("implementation_tier"), "unclassified"),
+        }
+        for path, value in runs
+    ]
+
+
+def resource_rows(root: Path) -> list[dict]:
+    rows = []
+    for path, audit in results(root, "quantization_audit.json"):
+        config_path = path.parent / "config.json"
+        config = read_json(config_path) if config_path.is_file() else {}
+        if isinstance(config.get("config"), dict):
+            config = config["config"] | config
+        official = audit.get("kind") == "official_qwen_awq_cpu_dequantized_quality_anchor"
+        rows.append({
+            "run": str(path.parent.relative_to(root)),
+            "method": audit.get("method", config.get("method")),
+            "scheme_id": config.get("scheme_id"),
+            "scope": audit.get("scope", config.get("scope")),
+            "module_count": audit.get("module_count", audit.get("packed_modules")),
+            "logical_bits_per_weight": audit.get(
+                "logical_bits_per_weight", 4.15625 if official else None,
+            ),
+            "quantization_seconds": audit.get("elapsed_seconds"),
+            "quality_eval_storage": audit.get(
+                "quality_eval_storage",
+                "fp32_reference" if config.get("weight_bits") is None else "dequantized_cpu_simulation",
+            ),
+            "deployment_kernel_claim": audit.get("deployment_kernel_claim", False),
+            "reported_actual_compressed_memory": False,
+            "reported_speedup": False,
+        })
+    return rows
+
+
+def select_w4(runs: list[tuple[Path, dict]], reference: dict | None):
+    if reference is None or reference.get("status") != "complete":
+        return None
+    candidates = [
+        value for _path, value in runs
+        if value.get("status") == "complete"
+        and value.get("weight_bits") == 4
+        and value.get("activation_bits") is None
+        and value.get("implementation_tier") in W4_TIERS
+    ]
+    return select_best_local_w4(candidates, reference["samples"]) if candidates else None
+
+
+def table(rows: list[dict], columns: list[str]) -> str:
+    if not rows:
+        return "_No completed rows._\n"
+    lines = [
+        "| " + " | ".join(columns) + " |",
+        "| " + " | ".join("---" for _ in columns) + " |",
+    ]
+    lines.extend(
+        "| " + " | ".join(str(row.get(column, "")) for column in columns) + " |"
+        for row in rows
+    )
+    return "\n".join(lines) + "\n"
+
+
+def report_text(corpus, screen, full, tiers, resources, selection) -> str:
+    selected = (
+        f"Selected {selection['scheme_id']} / {selection['scope']} by the fixed rule."
+        if selection else
+        "Selection unavailable until paired official screen scores are complete."
+    )
+    return "\n".join([
+        "# Qwen2.5-VL quantization benchmark summary",
+        "",
+        "Target-text diagnostic PPL is intentionally absent from every ranking table.",
+        "",
+        "## Corpus PPL",
+        "",
+        table(corpus, [
+            "method", "scheme_id", "activation_bits", "weight_granularity",
+            "corpus", "ppl", "paired_nll_delta",
+            "paired_ci_lower", "paired_ci_upper", "paired_conclusion",
+        ]),
+        "## VLM screen",
+        "",
+        table(screen, [
+            "method", "scheme_id", "scope", "activation_bits", "weight_granularity",
+            "dataset", "official_score",
+            "retention_vs_bf16", "paired_ci_lower", "paired_ci_upper",
+            "paired_conclusion", "status",
+        ]),
+        "## Official full",
+        "",
+        table(full, ["method", "scheme_id", "scope", "dataset", "official_score", "status"]),
+        "## Method credibility tiers",
+        "",
+        table(tiers, ["method", "scheme_id", "scope", "implementation_tier", "claim"]),
+        "## Resource audit",
+        "",
+        table(resources, [
+            "method", "scheme_id", "scope", "module_count", "logical_bits_per_weight",
+            "quantization_seconds", "quality_eval_storage", "deployment_kernel_claim",
+        ]),
+        "## Best local W4",
+        "",
+        selected,
+        "",
+    ])
+
+
+def main() -> None:
+    parser = argparse.ArgumentParser(description="Aggregate corrected benchmark outputs")
+    parser.add_argument("--root", type=Path, required=True)
+    parser.add_argument("--output-dir", type=Path, required=True)
+    args = parser.parse_args()
+    args.output_dir.mkdir(parents=True, exist_ok=True)
+
+    corpus = corpus_rows(args.root)
+    screen_runs, full_runs = split_official(args.root)
+    screen, reference = screen_rows(screen_runs)
+    full = full_rows(full_runs)
+    tiers = tier_rows(screen_runs + full_runs)
+    resources = resource_rows(args.root)
+    selection = select_w4(screen_runs, reference)
+
+    for name, rows in (
+        ("corpus.csv", corpus),
+        ("vlm_screen.csv", screen),
+        ("official_full.csv", full),
+        ("method_tiers.csv", tiers),
+        ("resource_audit.csv", resources),
+    ):
+        write_summary(args.output_dir / name, rows)
+    if selection is not None:
+        atomic_json(args.output_dir / "best_local_w4.json", selection)
+    atomic_json(args.output_dir / "summary.json", {
+        "corpus": corpus,
+        "vlm_screen": screen,
+        "official_full": full,
+        "method_tiers": tiers,
+        "resource_audit": resources,
+        "best_local_w4": selection,
+        "ranking_excludes": [
+            "target_text_diagnostic",
+            "legacy_conditional_answer_ppl",
+            "activation_bits_4",
+            "local_awq",
+        ],
+        "actual_memory_or_speed_claims": False,
+    })
+    destination = args.output_dir / "report.md"
+    temporary = destination.with_suffix(".tmp")
+    temporary.write_text(report_text(corpus, screen, full, tiers, resources, selection))
+    temporary.replace(destination)
+
+
+if __name__ == "__main__":
+    main()

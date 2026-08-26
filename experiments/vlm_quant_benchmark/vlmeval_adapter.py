@@ -27,6 +27,7 @@ from .mbq import (
     mbq_calibration_batches,
 )
 from .official_awq import load_official_awq_dequantized
+from .provenance import source_digest
 from .runner import CALIBRATION_METHODS, calibration_batches, load_reference
 from .selection import select_linears
 
@@ -50,8 +51,11 @@ class Qwen25VLQuantized(Qwen2VLPromptMixin, BaseModel):
         strict_qwen_3b: bool = True,
         official_awq_path: str | None = None,
         calibration_cache_dir: str | None = None,
+        model_revision_digest: str | None = None,
         calibration_samples: int = 128,
+        omniquant_steps: int = 20,
         scheme_id: str = "",
+        weight_granularity: str | None = None,
         **kwargs,
     ) -> None:
         super().__init__(use_custom_prompt=True, **kwargs)
@@ -70,11 +74,14 @@ class Qwen25VLQuantized(Qwen2VLPromptMixin, BaseModel):
             activation_bits=activation, group_size=group_size,
             zero_point=bits is not None and activation is None,
             weight_granularity=(
-                "per_output_channel"
-                if method_name == MethodName.MBQ and activation == 8
-                else "groupwise"
+                weight_granularity or (
+                    "per_output_channel"
+                    if method_name == MethodName.MBQ and activation == 8
+                    else "groupwise"
+                )
             ),
             calibration_samples=calibration_samples,
+            omniquant_steps=omniquant_steps,
             scheme_id=scheme_id,
             max_new_tokens=max_new_tokens,
             min_pixels=min_pixels, max_pixels=max_pixels, seed=seed,
@@ -117,7 +124,7 @@ class Qwen25VLQuantized(Qwen2VLPromptMixin, BaseModel):
             )
             if method_name == MethodName.MBQ:
                 cache_key = mbq_cache_key(
-                    model_revision=str(Path(model_path).resolve()),
+                    model_revision=model_revision_digest or source_digest(model_path),
                     calibration_digest=sample_manifest_digest(calibration_subset),
                     selected_names=[item.name for item in selected],
                     config=self.quant_config,
@@ -141,7 +148,7 @@ class Qwen25VLQuantized(Qwen2VLPromptMixin, BaseModel):
                 )
             else:
                 cache_key = calibration_cache_key(
-                    model_revision=str(Path(model_path).resolve()),
+                    model_revision=model_revision_digest or source_digest(model_path),
                     calibration_digest=sample_manifest_digest(calibration_subset),
                     selected_names=[item.name for item in selected],
                     min_pixels=min_pixels,
