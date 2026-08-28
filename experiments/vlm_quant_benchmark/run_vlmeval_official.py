@@ -53,9 +53,14 @@ def parse_args() -> argparse.Namespace:
         "--weight-granularity", choices=("groupwise", "per_output_channel"))
     parser.add_argument("--scheme-id")
     parser.add_argument("--calibration-manifest", type=Path)
+    parser.add_argument("--calibration-cache-dir", type=Path)
     parser.add_argument("--screen-manifest", type=Path)
+    parser.add_argument("--expected-samples-per-dataset", type=int)
     parser.add_argument("--datasets", default=",".join(DATASETS))
-    parser.add_argument("--preset", choices=("smoke", "timing", "screen", "full"), default="screen")
+    parser.add_argument(
+        "--preset", choices=("smoke", "timing", "screen", "confirm", "full"),
+        default="screen",
+    )
     parser.add_argument("--output-dir", type=Path, required=True)
     parser.add_argument("--judge-cache-dir", type=Path)
     parser.add_argument("--judge-model", default="gpt-4o-mini")
@@ -63,7 +68,9 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--threads", type=int, default=16)
     parser.add_argument("--resume", action="store_true")
-    parser.add_argument("--reuse-predictions-from", type=Path)
+    parser.add_argument(
+        "--reuse-predictions-from", type=Path, action="append", default=[],
+    )
     parser.add_argument("--allow-nonstandard-model", action="store_true")
     return parser.parse_args()
 
@@ -98,13 +105,99 @@ def canonical_index(value) -> str:
     return text[:-2] if text.endswith(".0") else text
 
 
+PREDICTION_COMPARABLE_FIELDS = (
+    "method", "scope", "weight_bits", "activation_bits", "group_size",
+    "zero_point", "weight_granularity",
+)
+
+
+def comparable_config_value(payload: dict, key: str):
+    value = payload.get(key)
+    if key == "weight_granularity" and value is None:
+        return "groupwise"
+    if key == "zero_point" and value is None:
+        return (
+            payload.get("weight_bits") is not None
+            and payload.get("activation_bits") is None
+        )
+    return value
+
+
+def merge_prediction_donors(
+    current_rows: list[dict],
+    donor_roots: list[Path],
+    *,
+    config: dict,
+    dataset_name: str,
+    expected_rows: dict[str, str],
+) -> tuple[list[dict], list[dict]]:
+    """Merge resumable and donor predictions with strict config/hash checks."""
+    merged: dict[str, dict] = {}
+    for row in current_rows:
+        index = canonical_index(row.get("index"))
+        if index in merged:
+            raise ValueError(f"duplicate generation index: {dataset_name}:{index}")
+        if index not in expected_rows:
+            raise ValueError(f"unexpected generation index: {dataset_name}:{index}")
+        if row.get("dataset_row_sha256") != expected_rows[index]:
+            raise ValueError(f"resume row hash mismatch: {dataset_name}:{index}")
+        normalized = dict(row)
+        normalized["index"] = index
+        merged[index] = normalized
+
+    details = []
+    for root in donor_roots:
+        config_path = root / "config.json"
+        donor_path = root / dataset_name / "generations.partial.jsonl"
+        detail = {"root": str(root), "matched": 0, "status": "missing"}
+        if not config_path.is_file() or not donor_path.is_file():
+            details.append(detail)
+            continue
+        donor_config = json.loads(config_path.read_text())
+        mismatch = [
+            key for key in PREDICTION_COMPARABLE_FIELDS
+            if comparable_config_value(donor_config, key)
+            != comparable_config_value(config, key)
+        ]
+        if mismatch:
+            raise ValueError(
+                f"prediction donor config mismatch for {mismatch}: {root}"
+            )
+        donor_rows = read_jsonl(donor_path)
+        seen = set()
+        for row in donor_rows:
+            index = canonical_index(row.get("index"))
+            if index in seen:
+                raise ValueError(f"duplicate donor index: {root}:{dataset_name}:{index}")
+            seen.add(index)
+            if (
+                index not in expected_rows
+                or row.get("dataset_row_sha256") != expected_rows[index]
+            ):
+                continue
+            if index in merged:
+                if merged[index].get("prediction") != row.get("prediction"):
+                    raise ValueError(
+                        f"prediction donor conflict: {dataset_name}:{index}"
+                    )
+                continue
+            normalized = dict(row)
+            normalized["index"] = index
+            normalized.setdefault("prediction_source", f"donor:{root}")
+            merged[index] = normalized
+            detail["matched"] += 1
+        detail["status"] = "used"
+        details.append(detail)
+    return list(merged.values()), details
+
+
 def selected_data(dataset, name: str, args):
     if args.preset == "full":
         return dataset.data.copy(), []
     if args.screen_manifest is None:
         if args.preset == "smoke":
             return dataset.data.iloc[:1].copy(), []
-        raise ValueError("--screen-manifest is required for screen")
+        raise ValueError("--screen-manifest is required for screen/confirm")
     if args.preset == "smoke":
         manifest = [item for item in load_manifest(args.screen_manifest) if item.dataset == name]
         if not manifest:
@@ -115,8 +208,15 @@ def selected_data(dataset, name: str, args):
             raise ValueError(f"{name} smoke index {wanted} is not unique upstream")
         return selected.copy(), manifest[:1]
     manifest = [item for item in load_manifest(args.screen_manifest) if item.dataset == name]
-    if len(manifest) != 64:
-        raise ValueError(f"{name} fixed manifest requires exactly 64 rows")
+    expected = (
+        args.expected_samples_per_dataset
+        if args.expected_samples_per_dataset is not None
+        else 256 if args.preset == "confirm" else 64
+    )
+    if len(manifest) != expected:
+        raise ValueError(
+            f"{name} {args.preset} manifest requires exactly {expected} rows"
+        )
     if args.preset == "timing":
         manifest = manifest[:32]
     positions = {
@@ -338,6 +438,7 @@ def main() -> None:
         "weight_granularity": weight_granularity,
         "zero_point": args.weight_bits is not None and args.activation_bits is None,
         "preset": args.preset,
+        "expected_samples_per_dataset": args.expected_samples_per_dataset,
         "datasets": datasets,
         "seed": args.seed,
         "min_pixels": 256 * 28 * 28,
@@ -392,51 +493,21 @@ def main() -> None:
             generated = read_jsonl(progress_path)
         else:
             generated = []
-        if not generated and args.reuse_predictions_from is not None:
-            donor_config_path = args.reuse_predictions_from / "config.json"
-            donor_path = (
-                args.reuse_predictions_from / dataset_name / "generations.partial.jsonl"
-            )
-            if donor_config_path.is_file() and donor_path.is_file():
-                donor_config = json.loads(donor_config_path.read_text())
-                comparable = (
-                    "method", "scope", "weight_bits", "activation_bits", "group_size",
-                    "zero_point", "weight_granularity",
-                )
-                def comparable_value(payload, key):
-                    value = payload.get(key)
-                    if key == "weight_granularity" and value is None:
-                        return "groupwise"
-                    if key == "zero_point" and value is None:
-                        return (
-                            payload.get("weight_bits") is not None
-                            and payload.get("activation_bits") is None
-                        )
-                    return value
-
-                mismatch = [
-                    key for key in comparable
-                    if comparable_value(donor_config, key) != comparable_value(config, key)
-                ]
-                if mismatch:
-                    raise ValueError(
-                        f"prediction donor config mismatch for {mismatch}: "
-                        f"{args.reuse_predictions_from}"
-                    )
-                expected_rows = {
-                    canonical_index(line["index"]): sha256_json({
-                        str(key): str(value) for key, value in line.to_dict().items()
-                    })
-                    for _, line in data.iterrows()
-                }
-                generated = [
-                    row for row in read_jsonl(donor_path)
-                    if row.get("index") in expected_rows
-                    and row.get("dataset_row_sha256") == expected_rows[row["index"]]
-                ]
+        expected_rows = {
+            canonical_index(line["index"]): sha256_json({
+                str(key): str(value) for key, value in line.to_dict().items()
+            })
+            for _, line in data.iterrows()
+        }
+        resumed_count = len(generated)
+        generated, donor_details = merge_prediction_donors(
+            generated,
+            args.reuse_predictions_from,
+            config=config,
+            dataset_name=dataset_name,
+            expected_rows=expected_rows,
+        )
         by_index = {row["index"]: row for row in generated}
-        if len(by_index) != len(generated):
-            raise ValueError(f"duplicate generation index: {dataset_name}")
         expected_indices = set(progress_meta["indices"])
         if set(by_index) - expected_indices:
             raise ValueError(f"unexpected generation index: {dataset_name}")
@@ -444,6 +515,13 @@ def main() -> None:
             generation_pending = True
         prepared[dataset_name] = {
             "destination": destination,
+            "reuse": {
+                "expected": len(expected_indices),
+                "resumed": resumed_count,
+                "donors": donor_details,
+                "reused_total": len(by_index),
+                "pending_after_reuse": len(expected_indices - set(by_index)),
+            },
             "dataset": dataset,
             "data": data,
             "manifest": manifest,
@@ -453,6 +531,12 @@ def main() -> None:
             "by_index": by_index,
         }
 
+    atomic_json(args.output_dir / "prediction_reuse.json", {
+        "status": "prepared",
+        "datasets": {
+            name: state["reuse"] for name, state in prepared.items()
+        },
+    })
     audit_path = args.output_dir / "quantization_audit.json"
     if generation_pending:
         model = Qwen25VLQuantized(
@@ -471,7 +555,10 @@ def main() -> None:
             seed=args.seed,
             strict_qwen_3b=not args.allow_nonstandard_model,
             official_awq_path=args.official_awq_path,
-            calibration_cache_dir=str(args.output_dir.parent / "_calibration_cache"),
+            calibration_cache_dir=str(
+                args.calibration_cache_dir
+                or args.output_dir.parent / "_calibration_cache"
+            ),
             model_revision_digest=digests["base_model"],
             calibration_samples=2 if args.preset == "smoke" else 128,
             omniquant_steps=2 if args.preset == "smoke" else 20,
@@ -518,6 +605,7 @@ def main() -> None:
                         str(key): str(value) for key, value in line.to_dict().items()
                     }),
                     "prediction": "",
+                    "prediction_source": "generated_v4",
                 }
                 generation_started = perf_counter()
                 row["prediction"] = model.generate_inner(messages, dataset=dataset_name)
@@ -627,6 +715,20 @@ def main() -> None:
             summaries[dataset_name] = score_payload
             combined.extend(scored)
 
+        reuse_payload = {
+            "status": "complete",
+            "datasets": {},
+        }
+        for name, state in prepared.items():
+            source_counts = {}
+            for row in state["by_index"].values():
+                source = row.get("prediction_source", "resume_unknown")
+                source_counts[source] = source_counts.get(source, 0) + 1
+            reuse_payload["datasets"][name] = state["reuse"] | {
+                "completed": len(state["by_index"]),
+                "prediction_sources": source_counts,
+            }
+        atomic_json(args.output_dir / "prediction_reuse.json", reuse_payload)
         payload = {
             "run_id": f"{config['method']}__{scheme}__{scope.value}__{config_digest[:12]}",
             "method": config["method"],

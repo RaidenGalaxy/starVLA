@@ -26,6 +26,7 @@ from .reporting import atomic_json
 
 DATASETS = ACTIVE_DATASET_NAMES
 VLMEVALKIT_REVISION = "4c4540cb19610b166499d004873674d00c88680f"
+CONFIRM_PROTOCOL_VERSION = 4
 
 
 def _value(line, names, default=""):
@@ -113,8 +114,59 @@ def _stratified_circular_indices(data, count: int, seed: int) -> list[int]:
     return sorted(selected)
 
 
+def extend_positions(
+    data,
+    *,
+    count: int,
+    seed: int,
+    preserved_indices: list[str],
+) -> tuple[list[int], list[int]]:
+    """Preserve a pinned prefix and draw a disjoint stratified extension."""
+    if count <= 0 or count > len(data):
+        raise ValueError(f"sample count must be in [1, {len(data)}], got {count}")
+    if len(preserved_indices) > count:
+        raise ValueError(
+            f"preserved manifest has {len(preserved_indices)} rows, exceeding target {count}"
+        )
+    if len(set(preserved_indices)) != len(preserved_indices):
+        raise ValueError("preserved manifest contains duplicate official indices")
+    positions_by_index = {
+        str(_value(row, ("index", "id"), position)): position
+        for position, (_, row) in enumerate(data.iterrows())
+    }
+    try:
+        preserved = [positions_by_index[str(index)] for index in preserved_indices]
+    except KeyError as error:
+        raise ValueError(f"preserved index absent upstream: {error}") from error
+    preserved_set = set(preserved)
+    if "g_index" in data.columns and preserved_set:
+        groups: dict[str, set[int]] = {}
+        for position, (_, row) in enumerate(data.iterrows()):
+            groups.setdefault(str(row["g_index"]), set()).add(position)
+        partial = [
+            name for name, positions in groups.items()
+            if positions & preserved_set and not positions <= preserved_set
+        ]
+        if partial:
+            raise ValueError(
+                f"preserved manifest splits {len(partial)} circular groups: {partial[:4]}"
+            )
+    remaining_positions = [
+        position for position in range(len(data)) if position not in preserved_set
+    ]
+    additional_count = count - len(preserved)
+    if additional_count == 0:
+        return preserved, []
+    remaining = data.iloc[remaining_positions].reset_index(drop=True)
+    relative = _stratified_circular_indices(remaining, additional_count, seed)
+    additional = [remaining_positions[position] for position in relative]
+    if preserved_set & set(additional):
+        raise AssertionError("stratified extension overlaps preserved positions")
+    return preserved + additional, additional
+
+
 def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="Prepare pinned VLMEvalKit 4x64 screen manifest")
+    parser = argparse.ArgumentParser(description="Prepare pinned VLMEvalKit screen/confirm manifest")
     parser.add_argument("--output-dir", type=Path, required=True)
     parser.add_argument("--lmu-data-root", type=Path)
     parser.add_argument("--calibration-manifest", type=Path)
@@ -149,34 +201,30 @@ def main() -> None:
     preserved: dict[str, list[str]] = {}
     if args.previous_manifest is not None:
         for sample in load_manifest(args.previous_manifest):
-            if sample.dataset in {"DocVQA_VAL", "MMMU_DEV_VAL"}:
+            if sample.dataset in DATASETS:
                 preserved.setdefault(sample.dataset, []).append(sample.official_index)
+        missing = set(DATASETS) - set(preserved)
+        if missing:
+            raise ValueError(f"previous manifest is missing datasets: {sorted(missing)}")
     samples = []
+    selection_metadata = {}
     for dataset_name in DATASETS:
         dataset = build_dataset(dataset_name)
-        if dataset_name in preserved:
-            wanted = preserved[dataset_name]
-            if len(wanted) != args.samples_per_dataset:
-                raise ValueError(
-                    f"{dataset_name} preserved manifest must have "
-                    f"{args.samples_per_dataset} rows"
-                )
-            positions_by_index = {
-                str(_value(row, ("index", "id"), position)): position
-                for position, (_, row) in enumerate(dataset.data.iterrows())
-            }
-            try:
-                positions = [positions_by_index[str(index)] for index in wanted]
-            except KeyError as error:
-                raise ValueError(
-                    f"preserved {dataset_name} index absent upstream: {error}"
-                ) from error
-        else:
-            positions = _stratified_circular_indices(
-                dataset.data,
-                args.samples_per_dataset,
-                args.seed,
-            )
+        positions, additional = extend_positions(
+            dataset.data,
+            count=args.samples_per_dataset,
+            seed=args.seed,
+            preserved_indices=preserved.get(dataset_name, []),
+        )
+        selection_metadata[dataset_name] = {
+            "preserved_count": len(preserved.get(dataset_name, [])),
+            "additional_count": len(additional),
+            "preserved_indices": list(preserved.get(dataset_name, [])),
+            "additional_indices": [
+                str(_value(dataset.data.iloc[position], ("index", "id"), position))
+                for position in additional
+            ],
+        }
         builder = PromptBuilder(dataset)
         for position in positions:
             line = dataset.data.iloc[position]
@@ -194,7 +242,7 @@ def main() -> None:
             samples.append(MultimodalSample(
                 id=f"{dataset_name}:{official_index}",
                 dataset=dataset_name,
-                split="screen",
+                split="screen" if args.samples_per_dataset == 64 else "confirm",
                 image=images[0],
                 extra_images=tuple(images[1:]),
                 prompt=prompt,
@@ -208,7 +256,12 @@ def main() -> None:
             ))
     if args.calibration_manifest is not None:
         assert_disjoint(load_manifest(args.calibration_manifest), samples)
-    manifest_path = args.output_dir / "vlm_screen_4x64.jsonl"
+    manifest_name = (
+        "vlm_screen_4x64.jsonl"
+        if args.samples_per_dataset == 64
+        else f"vlm_confirm_4x{args.samples_per_dataset}.jsonl"
+    )
+    manifest_path = args.output_dir / manifest_name
     write_manifest(manifest_path, samples)
 
     def md5(path: Path) -> str:
@@ -231,10 +284,21 @@ def main() -> None:
             "source_split": DATASET_SPECS[dataset_name].source_split,
         }
     atomic_json(args.output_dir / "dataset_protocol.json", {
-        "protocol_version": PROTOCOL_VERSION,
+        "protocol_version": (
+            PROTOCOL_VERSION if args.samples_per_dataset == 64
+            else CONFIRM_PROTOCOL_VERSION
+        ),
         "vlmevalkit_revision": VLMEVALKIT_REVISION,
         "seed": args.seed,
         "samples_per_dataset": args.samples_per_dataset,
+        "selection": selection_metadata,
+        "parent_manifest": (
+            None if args.previous_manifest is None else {
+                "path": str(args.previous_manifest.resolve()),
+                "sha256": file_digest(args.previous_manifest),
+                "rows": sum(len(value) for value in preserved.values()),
+            }
+        ),
         "datasets": dataset_files,
         "manifest": {
             "path": str(manifest_path.resolve()),
