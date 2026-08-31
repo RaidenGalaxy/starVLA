@@ -17,6 +17,7 @@ ACTIVE_METHODS = {"mbq", "omniquant", "squeezellm"}
 OCR_DATASETS = ("DocVQA_VAL", "TextVQA_VAL")
 REASONING_DATASETS = ("MMMU_DEV_VAL", "ScienceQA_TEST")
 BINARY_DATASETS = set(REASONING_DATASETS)
+PPL_CORPORA = ("c4_validation", "ptb_test", "wikitext2_test")
 LEGACY_CORPUS_ALIASES = {
     "omniquant_w4a16_g128_asym": "local_omniquant_w4a16_g128_asym",
     "squeezellm_w4a16_g128_asym": "local_squeezellm_w4a16_g128_asym",
@@ -199,6 +200,32 @@ def ppl_inflation(
     return sum(ratios) / len(ratios) if ratios else math.inf
 
 
+def ppl_values(
+    scheme: str,
+    corpus_root: Path,
+    legacy_root: Path | None,
+) -> dict[str, float]:
+    payload = load_ppl(corpus_root, scheme) or load_ppl(legacy_root, scheme)
+    if payload is None:
+        return {name: math.inf for name in PPL_CORPORA}
+    values = {}
+    for name in PPL_CORPORA:
+        value = float(payload.get(name, {}).get("ppl", math.inf))
+        values[name] = value if math.isfinite(value) and value > 0 else math.inf
+    return values
+
+
+def classify_ppl_health(inflation: float) -> str:
+    """Project heuristic for decoder language-health, not a paper standard."""
+    if not math.isfinite(inflation):
+        return "missing"
+    if inflation <= 1.10:
+        return "pass"
+    if inflation <= 1.25:
+        return "caution"
+    return "fail"
+
+
 def values_for(run: dict, dataset: str, indices: list[str]) -> list[float]:
     try:
         return [run["samples"][dataset][index] for index in indices]
@@ -254,6 +281,47 @@ def classify_quality(
     }
 
 
+def usability_assessment(
+    quality: dict,
+    inflation: float,
+    paired: dict,
+    stable: bool,
+) -> dict:
+    ppl_health = classify_ppl_health(inflation)
+    significant_regressions = [
+        name for name, value in paired.items()
+        if value.get("conclusion") == "degraded"
+    ]
+    reasons = []
+    if quality["tier"] == "reference":
+        status = "reference"
+    elif quality["tier"] == "degraded":
+        status = "not_usable"
+        reasons.append("VLM质量未达到可用门槛")
+    elif ppl_health in {"fail", "missing"}:
+        status = "conditional"
+        reasons.append("PPL健康检查失败或缺失")
+    elif significant_regressions or not stable or ppl_health == "caution":
+        status = "conditional"
+    elif quality["tier"] == "high_precision":
+        status = "high_precision_usable"
+    else:
+        status = "usable"
+    if significant_regressions:
+        reasons.append("显著退化任务=" + ",".join(significant_regressions))
+    if not stable:
+        reasons.append("64与独立192切片方向不稳定")
+    if ppl_health == "caution":
+        reasons.append("PPL膨胀处于警戒区间")
+    return {
+        "status": status,
+        "ppl_health": ppl_health,
+        "significant_regressions": significant_regressions,
+        "stable_64_vs_192": stable,
+        "reasons": reasons,
+    }
+
+
 def rank_key(row: dict) -> tuple:
     return (
         -row["quality"]["worst_retention"],
@@ -276,22 +344,32 @@ def write_csv(path: Path, rows: list[dict]) -> None:
 def table(rows: list[dict]) -> list[str]:
     lines = [
         "| method | format | DocVQA | MMMU | ScienceQA | TextVQA | "
-        "worst-ret | mean-ret | mean-drop | max-drop | tier | PPL× | BPW |",
-        "|---|---|---:|---:|---:|---:|---:|---:|---:|---:|---|---:|---:|",
+        "mean-score | worst-ret | mean-ret | mean-drop | max-drop | tier | "
+        "C4 PPL | PTB PPL | WikiText-2 PPL | mean PPL× | BPW |",
+        "|---|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---|"
+        "---:|---:|---:|---:|---:|",
     ]
     for row in rows:
         scores = row["slices"]["combined256"]["scores"]
         quality = row["quality"]
         ppl = row["ppl_inflation"]
         ppl_text = "-" if not math.isfinite(ppl) else f"{ppl:.3f}"
+        absolute_ppl = {
+            name: "-" if not math.isfinite(row["ppl"][name])
+            else f"{row['ppl'][name]:.3f}"
+            for name in PPL_CORPORA
+        }
         lines.append(
             f"| {row['method']} | {row['format']} | "
             f"{scores['DocVQA_VAL']:.2f} | {scores['MMMU_DEV_VAL']:.2f} | "
             f"{scores['ScienceQA_TEST']:.2f} | {scores['TextVQA_VAL']:.2f} | "
+            f"{row['mean_score']:.2f} | "
             f"{quality['worst_retention']:.2f}% | "
             f"{quality['mean_retention']:.2f}% | "
             f"{quality['mean_drop_pp']:.2f} | {quality['max_drop_pp']:.2f} | "
-            f"{quality['tier']} | {ppl_text} | "
+            f"{quality['tier']} | {absolute_ppl['c4_validation']} | "
+            f"{absolute_ppl['ptb_test']} | "
+            f"{absolute_ppl['wikitext2_test']} | {ppl_text} | "
             f"{row['logical_bits_per_weight']:.3f} |"
         )
     return lines
@@ -416,7 +494,12 @@ def main() -> None:
             if deltas64[name] * deltas192[name] < 0
         ] if run is not reference else []
         bits = run["weight_bits"]
-        rows.append({
+        inflation = ppl_inflation(
+            run["scheme_id"], reference["scheme_id"],
+            args.corpus_root, args.legacy_corpus_root,
+        )
+        stable = not sign_flips
+        row = {
             "method": run["method"],
             "scheme_id": run["scheme_id"],
             "scope": run["scope"],
@@ -424,10 +507,11 @@ def main() -> None:
             "activation_bits": run["activation_bits"],
             "format": "BF16" if bits is None else f"W{bits}A{run['activation_bits'] or 16}",
             "logical_bits_per_weight": run["logical_bits_per_weight"],
-            "ppl_inflation": ppl_inflation(
-                run["scheme_id"], reference["scheme_id"],
-                args.corpus_root, args.legacy_corpus_root,
+            "mean_score": sum(combined_scores.values()) / len(combined_scores),
+            "ppl": ppl_values(
+                run["scheme_id"], args.corpus_root, args.legacy_corpus_root,
             ),
+            "ppl_inflation": inflation,
             "slices": slice_payload,
             "confidence_intervals": confidence,
             "paired_vs_bf16": paired,
@@ -436,9 +520,13 @@ def main() -> None:
                 "delta_screen64_pp": deltas64,
                 "delta_replication192_pp": deltas192,
                 "sign_flips": sign_flips,
-                "stable": not sign_flips,
+                "stable": stable,
             },
-        })
+        }
+        row["usability"] = usability_assessment(
+            quality, inflation, paired, stable,
+        )
+        rows.append(row)
 
     winners = {}
     pairwise_winner_runner_up = {}
@@ -484,6 +572,10 @@ def main() -> None:
 
     def serializable(row: dict) -> dict:
         return row | {
+            "ppl": {
+                name: None if not math.isfinite(value) else value
+                for name, value in row["ppl"].items()
+            },
             "ppl_inflation": (
                 None if not math.isfinite(row["ppl_inflation"])
                 else row["ppl_inflation"]
@@ -518,11 +610,16 @@ def main() -> None:
             "method": row["method"],
             "format": row["format"],
             **scores,
+            "mean_score": row["mean_score"],
             "worst_retention": row["quality"]["worst_retention"],
             "mean_retention": row["quality"]["mean_retention"],
             "mean_drop_pp": row["quality"]["mean_drop_pp"],
             "max_drop_pp": row["quality"]["max_drop_pp"],
             "tier": row["quality"]["tier"],
+            "usability": row["usability"]["status"],
+            "c4_ppl": row["ppl"]["c4_validation"],
+            "ptb_ppl": row["ppl"]["ptb_test"],
+            "wikitext2_ppl": row["ppl"]["wikitext2_test"],
             "ppl_inflation": (
                 "" if not math.isfinite(row["ppl_inflation"])
                 else row["ppl_inflation"]
@@ -561,6 +658,10 @@ def main() -> None:
     lines.extend(table(w4))
     lines.extend(["", "### W3A16", ""])
     lines.extend(table(w3))
+    lines.extend([
+        "",
+        "> `mean-score`为DocVQA、MMMU、ScienceQA、TextVQA四项0–100分数的算术均值，用于直观观察整体水平；最终工程排序仍优先考虑最差单项保留率，避免均值掩盖关键任务退化。",
+    ])
     lines.extend(["", "## 64筛选与独立192复现稳定性", ""])
     lines.extend([
         "| method | format | 64→192发生退化方向翻转的数据集 | stable |",
@@ -588,6 +689,45 @@ def main() -> None:
                 f"{value['delta_pp']:+.2f} | [{low:.2f}, {high:.2f}] | "
                 f"{value['conclusion']} | {p_text} |"
             )
+    lines.extend(["", "## 如何判断量化后的模型是否可用", ""])
+    lines.extend([
+        "量化模型是否可用不能由单个平均分或单个PPL决定。本报告采用以下顺序：",
+        "",
+        "1. **运行完整性硬门槛**：四个数据集必须均为256/256，预测、评分和PPL均为有限值，且无NaN/Inf或生成失败。",
+        "2. **VLM任务质量主门槛**：`high_precision`要求平均保留率≥97%、最差保留率≥95%、平均下降≤2pp、最大下降≤5pp；`usable`要求平均保留率≥90%、最差保留率≥85%、平均下降≤5pp、最大下降≤10pp；否则为`degraded`。四项条件必须同时满足。",
+        "3. **配对统计复核**：在相同样本上相对BF16做配对bootstrap；置信区间完全低于0的任务标为显著退化。质量门槛通过但关键任务显著下降时，只判为条件可用，并明确限制使用场景。",
+        "4. **抽样稳定性复核**：比较原64样本与独立192样本的退化方向；发生方向翻转时标记抽样不稳定，不依据微小均值差异作强结论。",
+        "5. **PPL语言健康检查**：PPL越低越好，`mean PPL×`是C4、PTB、WikiText-2相对BF16比值的算术平均。本项目暂以≤1.10为通过、(1.10,1.25]为警戒、>1.25为失败；这是工程启发式门槛，不是论文或行业通用标准。PPL只衡量decoder语言建模健康度，不能替代VLM任务评分。",
+        "6. **部署确认**：本轮为解量化CPU质量模拟；真正部署前还需验证打包模型的显存、吞吐、延迟及目标业务分布。",
+        "",
+        "### 各配置可用性结论",
+        "",
+        "| method | format | VLM tier | PPL health | significant regression | 64/192 stable | final assessment |",
+        "|---|---|---|---|---|---|---|",
+    ])
+    assessment_labels = {
+        "reference": "基准",
+        "high_precision_usable": "高精度可用",
+        "usable": "可用",
+        "conditional": "条件可用",
+        "not_usable": "不可用",
+    }
+    for row in [bf, *w4, *w3]:
+        usability = row["usability"]
+        regressions = ", ".join(usability["significant_regressions"]) or "-"
+        lines.append(
+            f"| {row['method']} | {row['format']} | {row['quality']['tier']} | "
+            f"{usability['ppl_health']} | {regressions} | "
+            f"{'yes' if usability['stable_64_vs_192'] else 'no'} | "
+            f"{assessment_labels[usability['status']]} |"
+        )
+    lines.extend([
+        "",
+        "- **SqueezeLLM W4A16：可用且为当前推荐。** 四项VLM质量满足usable门槛，三项PPL平均仅为BF16的1.034倍，所有任务的配对95%区间均包含0，且64/192切片方向稳定。",
+        "- **MBQ W4A16：条件可用。** PPL健康检查通过，但MMMU相对BF16显著下降5.86pp，且ScienceQA在64/192切片出现方向翻转；适合OCR优先、非推理关键场景，部署前应补充目标域推理评测。",
+        "- **OmniQuant W4A16：条件可用。** 平均PPL膨胀最低，但MMMU同样显著下降5.86pp，DocVQA与TextVQA存在切片方向翻转；不能仅依据PPL较低认定整体质量更好。",
+        "- **全部W3A16：不可用。** 三种方法均未达到VLM usable门槛，且四项任务相对BF16的配对区间全部低于0；SqueezeLLM W3的PPL虽仅处于警戒区间，仍不能抵消多模态任务的确认退化。",
+    ])
     lines.extend(["", "## RTN历史64样本参考（不参与排名）", ""])
     lines.extend([
         "| method | format | DocVQA | MMMU | ScienceQA | TextVQA | status |",

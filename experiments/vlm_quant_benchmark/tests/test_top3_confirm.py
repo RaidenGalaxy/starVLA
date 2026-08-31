@@ -133,6 +133,14 @@ def test_quality_classification_thresholds():
     )["tier"] == "degraded"
 
 
+def test_ppl_health_project_thresholds():
+    assert report.classify_ppl_health(1.10) == "pass"
+    assert report.classify_ppl_health(1.11) == "caution"
+    assert report.classify_ppl_health(1.25) == "caution"
+    assert report.classify_ppl_health(1.26) == "fail"
+    assert report.classify_ppl_health(float("inf")) == "missing"
+
+
 def _result(root: Path, method: str, bits: int | None, count: int):
     scheme = (
         "bf16_value_fp32_compute"
@@ -203,4 +211,13 @@ def test_report_accepts_256_top3_and_keeps_rtn_historical(
     assert all(
         winner["method"] != "rtn"
         for winner in selection["winners"].values()
+    )
+    text = (output / "report_zh.md").read_text()
+    assert "mean-score" in text
+    assert "C4 PPL" in text
+    assert "WikiText-2 PPL" in text
+    assert "如何判断量化后的模型是否可用" in text
+    assert all(
+        "mean_score" in run and "ppl" in run and "usability" in run
+        for run in summary["runs"]
     )
