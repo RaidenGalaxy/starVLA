@@ -63,14 +63,19 @@ class ExperimentConfig:
     mbq_loss_mode: str = "mae"
     mbq_reweight: bool = True
     mbq_distort: bool = False
+    mbq_gradient_aggregation: str = "pooled_elements"
+    mbq_objective_normalization: str = "token_weighted"
+    mbq_median_floor: bool = True
+    mbq_reconstruction_level: str = "linear_group"
     mbq_upstream_commit: str = "a4d460dfb4b1c07b5d1f3ddda6e86d1c90d6e7f1"
-    mbq_algorithm_version: int = 2
+    mbq_algorithm_version: int = 4
     weight_granularity: str = "groupwise"
     smoothquant_alpha: float = 0.5
     llm_int8_threshold: float = 6.0
     tender_groups: int = 4
     omniquant_steps: int = 20
     squeezellm_kmeans_steps: int = 5
+    squeezellm_sparse_fraction: float = 0.0045
     scheme_id: str = ""
     implementation_tier: ImplementationTier | str = ImplementationTier.LOCAL_VALIDATED
     calibration_protocol: str = "c4_128x2048"
@@ -107,10 +112,22 @@ class ExperimentConfig:
             raise ValueError("mbq_scale_grid values must satisfy 0 <= value < 1")
         if self.mbq_loss_mode != "mae":
             raise ValueError("the validated MBQ path supports MAE reconstruction only")
-        if self.mbq_algorithm_version != 2:
+        if self.mbq_gradient_aggregation not in {
+            "pooled_elements", "sample_mean", "source_balanced",
+        }:
+            raise ValueError("unsupported MBQ gradient aggregation")
+        if self.mbq_objective_normalization not in {
+            "token_weighted", "modality_mean",
+        }:
+            raise ValueError("unsupported MBQ objective normalization")
+        if self.mbq_reconstruction_level not in {"linear_group", "block_output"}:
+            raise ValueError("unsupported MBQ reconstruction level")
+        if self.mbq_algorithm_version != 4:
             raise ValueError("unsupported MBQ algorithm version")
         if self.weight_granularity not in {"groupwise", "per_output_channel"}:
             raise ValueError("unsupported weight granularity")
+        if not 0 <= self.squeezellm_sparse_fraction < 1:
+            raise ValueError("squeezellm_sparse_fraction must satisfy 0 <= value < 1")
         if self.method == MethodName.MBQ:
             if self.scope != QuantScope.DECODER_CANONICAL:
                 raise ValueError("MBQ supports decoder_canonical scope only")
@@ -118,8 +135,8 @@ class ExperimentConfig:
                 raise ValueError("MBQ supports W3 or W4 weights in this benchmark")
             if self.weight_bits == 3 and self.activation_bits is not None:
                 raise ValueError("W3 is evaluated as W3A16 only")
-            if not self.mbq_reweight or self.mbq_distort:
-                raise ValueError("validated MBQ requires reweight=True and distort=False")
+            if self.mbq_distort:
+                raise ValueError("validated MBQ requires distort=False")
             if self.activation_bits is None:
                 if not self.zero_point or self.weight_granularity != "groupwise":
                     raise ValueError("MBQ W3A16/W4A16 requires asymmetric group-wise weights")

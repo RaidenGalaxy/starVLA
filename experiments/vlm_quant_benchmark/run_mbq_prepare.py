@@ -176,6 +176,7 @@ def main() -> None:
                         reservoir_rows=32,
                         seed=config.seed,
                         attention_implementation="sdpa",
+                        gradient_aggregation=config.mbq_gradient_aggregation,
                     )
                     shared_statistics_seconds = time.perf_counter() - statistics_started
                 stats, ratios, token_counts = shared_statistics

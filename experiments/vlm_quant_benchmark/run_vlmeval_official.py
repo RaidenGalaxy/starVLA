@@ -16,7 +16,7 @@ import torch
 
 from time import perf_counter
 
-from .config import MethodName, QuantScope
+from .config import ExperimentConfig, MethodName, QuantScope
 from .data import assert_disjoint, file_digest, load_manifest, normalized_question_digest
 from .dataset_protocol import (
     ACTIVE_DATASET_NAMES,
@@ -54,6 +54,10 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--scheme-id")
     parser.add_argument("--calibration-manifest", type=Path)
     parser.add_argument("--calibration-cache-dir", type=Path)
+    parser.add_argument(
+        "--experiment-config-json", type=Path,
+        help="Complete ExperimentConfig JSON for a promoted local variant.",
+    )
     parser.add_argument("--screen-manifest", type=Path)
     parser.add_argument("--expected-samples-per-dataset", type=int)
     parser.add_argument("--datasets", default=",".join(DATASETS))
@@ -108,6 +112,10 @@ def canonical_index(value) -> str:
 PREDICTION_COMPARABLE_FIELDS = (
     "method", "scope", "weight_bits", "activation_bits", "group_size",
     "zero_point", "weight_granularity",
+    "mbq_reweight", "mbq_gradient_aggregation",
+    "mbq_objective_normalization", "mbq_median_floor",
+    "mbq_reconstruction_level", "mbq_algorithm_version",
+    "squeezellm_sparse_fraction", "calibration_protocol",
 )
 
 
@@ -415,20 +423,31 @@ def main() -> None:
     datasets = [value.strip() for value in args.datasets.split(",") if value.strip()]
     if set(datasets) - set(DATASETS):
         raise ValueError(f"datasets must be a subset of {DATASETS}")
-    method, scope = MethodName(args.method), QuantScope(args.scope)
+    experiment_config = (
+        ExperimentConfig.from_dict(json.loads(args.experiment_config_json.read_text()))
+        if args.experiment_config_json else None
+    )
+    method = experiment_config.method if experiment_config else MethodName(args.method)
+    scope = experiment_config.scope if experiment_config else QuantScope(args.scope)
+    if experiment_config:
+        args.weight_bits = experiment_config.weight_bits
+        args.activation_bits = experiment_config.activation_bits
+        args.group_size = experiment_config.group_size
+        args.max_new_tokens = experiment_config.max_new_tokens
+        args.seed = experiment_config.seed
     weight_granularity = args.weight_granularity or (
-        "per_output_channel"
-        if method == MethodName.MBQ and args.activation_bits == 8
+        experiment_config.weight_granularity if experiment_config else
+        "per_output_channel" if method == MethodName.MBQ and args.activation_bits == 8
         else "groupwise"
     )
-    scheme = args.scheme_id or (
+    scheme = (experiment_config.scheme_id if experiment_config else args.scheme_id) or (
         "official_w4a16_g128_asym"
         if args.official_awq_path
         else "bf16_value_fp32_compute"
         if method == MethodName.BF16_VALUE_FP32_COMPUTE
         else f"{method.value}_w{args.weight_bits or 4}a{args.activation_bits or 16}_g{args.group_size}"
     )
-    config = {
+    config = (experiment_config.to_dict() if experiment_config else {}) | {
         "method": "official_qwen_awq" if args.official_awq_path else method.value,
         "scheme_id": scheme,
         "scope": scope.value,
@@ -436,13 +455,16 @@ def main() -> None:
         "activation_bits": args.activation_bits,
         "group_size": args.group_size,
         "weight_granularity": weight_granularity,
-        "zero_point": args.weight_bits is not None and args.activation_bits is None,
+        "zero_point": (
+            experiment_config.zero_point if experiment_config else
+            args.weight_bits is not None and args.activation_bits is None
+        ),
         "preset": args.preset,
         "expected_samples_per_dataset": args.expected_samples_per_dataset,
         "datasets": datasets,
         "seed": args.seed,
-        "min_pixels": 256 * 28 * 28,
-        "max_pixels": 1280 * 28 * 28,
+        "min_pixels": experiment_config.min_pixels if experiment_config else 256 * 28 * 28,
+        "max_pixels": experiment_config.max_pixels if experiment_config else 1280 * 28 * 28,
         "vlmevalkit_revision": VLMEVALKIT_REVISION,
         "judge": None,
         "protocol_version": PROTOCOL_VERSION,
@@ -455,6 +477,10 @@ def main() -> None:
             file_sha256(args.calibration_manifest) if args.calibration_manifest else ""
         ),
         "screen_manifest": file_sha256(args.screen_manifest) if args.screen_manifest else "",
+        "experiment_config": (
+            file_sha256(args.experiment_config_json)
+            if args.experiment_config_json else ""
+        ),
         "vlmevalkit_revision": VLMEVALKIT_REVISION,
     }
     args.output_dir.mkdir(parents=True, exist_ok=True)
@@ -564,6 +590,9 @@ def main() -> None:
             omniquant_steps=2 if args.preset == "smoke" else 20,
             scheme_id=scheme,
             weight_granularity=weight_granularity,
+            experiment_config=(
+                experiment_config.to_dict() if experiment_config else None
+            ),
         )
         audit = (
             model.official_awq_audit if args.official_awq_path else model.applied.audit

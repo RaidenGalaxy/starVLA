@@ -113,7 +113,12 @@ def _sparse_residual(source: nn.Linear, dense_weight: torch.Tensor,
                      stats: ActivationStats, fraction: float):
     residual = source.weight.detach().float() - dense_weight
     saliency = residual.abs() * stats.abs_mean.clamp_min(1e-8).sqrt().unsqueeze(0)
-    count = max(1, int(saliency.numel() * fraction))
+    count = int(saliency.numel() * fraction)
+    if count == 0:
+        return (
+            torch.empty((2, 0), dtype=torch.long, device=saliency.device),
+            torch.empty((0,), dtype=residual.dtype, device=residual.device),
+        )
     flat_indices = torch.topk(saliency.reshape(-1), count, sorted=False).indices
     rows = torch.div(flat_indices, source.in_features, rounding_mode="floor")
     columns = flat_indices.remainder(source.in_features)
@@ -172,13 +177,16 @@ def squeezellm_linear(source: nn.Linear, stats: ActivationStats, config: Experim
         restored[:, start:stop] = _weighted_codebook(
             weight[:, start:stop], sensitivity[start:stop], levels,
             config.squeezellm_kmeans_steps)
-    indices, values = _sparse_residual(source, restored, stats, 0.0045)
+    indices, values = _sparse_residual(
+        source, restored, stats, config.squeezellm_sparse_fraction,
+    )
     wrapper = SparseCorrectionLinear(source, restored, indices, values)
     index_bits = max(1, (source.weight.numel() - 1).bit_length())
     bpw = config.weight_bits + values.numel() * (16 + index_bits) / source.weight.numel()
     return wrapper, {"algorithm": "sensitivity_weighted_nonuniform_dense_sparse",
                      "centroids": levels,
                      "kmeans_steps": config.squeezellm_kmeans_steps,
+                     "configured_sparse_fraction": config.squeezellm_sparse_fraction,
                      "outlier_fraction": values.numel() / source.weight.numel(),
                      "estimated_bits_per_weight": bpw,
                      "quality_eval_storage": "dense_fp32_materialized",

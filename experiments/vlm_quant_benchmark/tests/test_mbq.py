@@ -136,7 +136,12 @@ def test_mbq_collects_modal_activations_and_sft_gradient_ratios():
     assert len(selected) == 7
     assert set(stats) == {item.name for item in selected}
     assert len(ratios) == 2
-    assert counts == {"vision": 2, "language": 2, "samples": 1}
+    assert counts == {
+        "vision": 2,
+        "language": 2,
+        "samples": 1,
+        "gradient_aggregation": "pooled_elements",
+    }
     assert all(value >= 0 and torch.isfinite(torch.tensor(value)) for value in ratios.values())
     assert all(value.vision.shape[0] == 2 for value in stats.values())
 

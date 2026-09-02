@@ -25,6 +25,7 @@ from .mbq import (
     collect_mbq_search_cached,
     mbq_cache_key,
     mbq_calibration_batches,
+    mbq_statistics_cache_key,
 )
 from .official_awq import load_official_awq_dequantized
 from .provenance import source_digest
@@ -56,6 +57,7 @@ class Qwen25VLQuantized(Qwen2VLPromptMixin, BaseModel):
         omniquant_steps: int = 20,
         scheme_id: str = "",
         weight_granularity: str | None = None,
+        experiment_config: dict | None = None,
         **kwargs,
     ) -> None:
         super().__init__(use_custom_prompt=True, **kwargs)
@@ -69,24 +71,35 @@ class Qwen25VLQuantized(Qwen2VLPromptMixin, BaseModel):
         bits = weight_bits if weight_bits is not None else (8 if activation else 4)
         if method_name == MethodName.BF16_VALUE_FP32_COMPUTE:
             bits, activation = None, None
-        self.quant_config = ExperimentConfig(
-            method_name, scope=quant_scope, weight_bits=bits,
-            activation_bits=activation, group_size=group_size,
-            zero_point=bits is not None and activation is None,
-            weight_granularity=(
-                weight_granularity or (
-                    "per_output_channel"
-                    if method_name == MethodName.MBQ and activation == 8
-                    else "groupwise"
-                )
-            ),
-            calibration_samples=calibration_samples,
-            omniquant_steps=omniquant_steps,
-            scheme_id=scheme_id,
-            max_new_tokens=max_new_tokens,
-            min_pixels=min_pixels, max_pixels=max_pixels, seed=seed,
-        )
+        if experiment_config is not None:
+            self.quant_config = ExperimentConfig.from_dict(experiment_config)
+            method_name, quant_scope = (
+                self.quant_config.method, self.quant_config.scope,
+            )
+            min_pixels = self.quant_config.min_pixels
+            max_pixels = self.quant_config.max_pixels
+            seed = self.quant_config.seed
+        else:
+            self.quant_config = ExperimentConfig(
+                method_name, scope=quant_scope, weight_bits=bits,
+                activation_bits=activation, group_size=group_size,
+                zero_point=bits is not None and activation is None,
+                weight_granularity=(
+                    weight_granularity or (
+                        "per_output_channel"
+                        if method_name == MethodName.MBQ and activation == 8
+                        else "groupwise"
+                    )
+                ),
+                calibration_samples=calibration_samples,
+                omniquant_steps=omniquant_steps,
+                scheme_id=scheme_id,
+                max_new_tokens=max_new_tokens,
+                min_pixels=min_pixels, max_pixels=max_pixels, seed=seed,
+            )
         if official_awq_path is not None:
+            if experiment_config is not None:
+                raise ValueError("official AWQ cannot use a local experiment config")
             if method_name != MethodName.BF16_VALUE_FP32_COMPUTE:
                 raise ValueError("official_awq_path cannot be combined with a local method")
             self.official_awq_audit = load_official_awq_dequantized(
@@ -143,6 +156,16 @@ class Qwen25VLQuantized(Qwen2VLPromptMixin, BaseModel):
                     self.quant_config,
                     cache_dir=cache_root,
                     key=cache_key,
+                    raw_key=mbq_statistics_cache_key(
+                        model_revision=model_revision_digest or source_digest(model_path),
+                        calibration_digest=sample_manifest_digest(calibration_subset),
+                        selected_names=[item.name for item in selected],
+                        reservoir_rows=32,
+                        seed=self.quant_config.seed,
+                        min_pixels=min_pixels,
+                        max_pixels=max_pixels,
+                        attention_implementation=calibration_attention,
+                    ),
                     reservoir_rows=32,
                     attention_implementation=calibration_attention,
                 )

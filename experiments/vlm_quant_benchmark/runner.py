@@ -23,6 +23,7 @@ from .mbq import (
     collect_mbq_search_cached,
     mbq_cache_key,
     mbq_calibration_batches,
+    mbq_statistics_cache_key,
 )
 from .provenance import completed_run, mark_complete
 from .reporting import atomic_json, write_report
@@ -193,6 +194,16 @@ def run_config(
                 config,
                 cache_dir=cache_root,
                 key=cache_key,
+                raw_key=mbq_statistics_cache_key(
+                    model_revision=input_digests["model"],
+                    calibration_digest=calibration_subset_digest,
+                    selected_names=[item.name for item in selected],
+                    reservoir_rows=32,
+                    seed=config.seed,
+                    min_pixels=config.min_pixels,
+                    max_pixels=config.max_pixels,
+                    attention_implementation=calibration_attention,
+                ),
                 reservoir_rows=32,
                 attention_implementation=calibration_attention,
             )

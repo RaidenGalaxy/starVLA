@@ -19,6 +19,7 @@ from .mbq import (
     collect_mbq_search_cached,
     mbq_cache_key,
     mbq_calibration_batches,
+    mbq_statistics_cache_key,
 )
 from .provenance import completed_run, mark_complete, sha256_json, source_digest
 from .reporting import atomic_json
@@ -207,6 +208,16 @@ def main() -> None:
                 config,
                 cache_dir=cache_dir,
                 key=key,
+                raw_key=mbq_statistics_cache_key(
+                    model_revision=model_digest,
+                    calibration_digest=sample_manifest_digest(samples),
+                    selected_names=[item.name for item in selected],
+                    reservoir_rows=32,
+                    seed=config.seed,
+                    min_pixels=config.min_pixels,
+                    max_pixels=config.max_pixels,
+                    attention_implementation="sdpa",
+                ),
                 reservoir_rows=32,
                 attention_implementation="sdpa",
             )
