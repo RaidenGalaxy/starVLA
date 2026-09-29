@@ -44,6 +44,7 @@ def capture_reconstruction_outputs(
     layers_to_test: tuple[int, ...],
     anchor_names: Iterable[str],
     attention_implementation: str = "sdpa",
+    capture_logits: bool = False,
 ) -> dict[str, torch.Tensor]:
     """Capture decoder block and selected linear outputs for one sample."""
     named = dict(model.named_modules())
@@ -70,10 +71,12 @@ def capture_reconstruction_outputs(
         handles.append(module.register_forward_hook(hook(key)))
     try:
         with temporary_attention_implementation(model, attention_implementation):
-            model(
+            output = model(
                 **batch["model_inputs"], use_cache=False, return_dict=True,
                 output_attentions=False, output_hidden_states=False,
             )
+            if capture_logits:
+                captured["logits"] = output.logits.detach().float().cpu().clone()
     finally:
         for handle in handles:
             handle.remove()
@@ -82,6 +85,32 @@ def capture_reconstruction_outputs(
         raise RuntimeError(f"reconstruction hooks did not fire: {sorted(missing)}")
     release_cpu_memory()
     return captured
+
+
+def prediction_change_summary(
+    reference_logits: torch.Tensor,
+    candidate_logits: torch.Tensor,
+    answer_mask: torch.Tensor,
+) -> dict:
+    if reference_logits.shape != candidate_logits.shape:
+        raise ValueError("prediction logits must have matching shapes")
+    mask = causal_predictor_mask(answer_mask.bool())
+    reference = reference_logits[mask]
+    candidate = candidate_logits[mask]
+    if not reference.numel():
+        raise ValueError("prediction comparison has no answer predictor positions")
+    reference_log_probs = reference.log_softmax(dim=-1)
+    candidate_log_probs = candidate.log_softmax(dim=-1)
+    reference_probs = reference_log_probs.exp()
+    kl = (reference_probs * (reference_log_probs - candidate_log_probs)).sum(dim=-1)
+    changes = reference.argmax(dim=-1).ne(candidate.argmax(dim=-1))
+    return {
+        "predictor_tokens": int(reference.shape[0]),
+        "output_kl": float(kl.mean().item()),
+        "argmax_change_rate": float(changes.float().mean().item()),
+    }
+
+
 
 
 def reconstruction_rows(

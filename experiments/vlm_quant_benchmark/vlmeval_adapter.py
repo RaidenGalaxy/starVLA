@@ -31,6 +31,10 @@ from .official_awq import load_official_awq_dequantized
 from .provenance import source_digest
 from .runner import CALIBRATION_METHODS, calibration_batches, load_reference
 from .selection import select_linears
+from experiments.vlm_quant_layer_pruning.core import (
+    decoder_layers,
+    temporary_generation_token_group_freeze,
+)
 
 
 class Qwen25VLQuantized(Qwen2VLPromptMixin, BaseModel):
@@ -58,10 +62,19 @@ class Qwen25VLQuantized(Qwen2VLPromptMixin, BaseModel):
         scheme_id: str = "",
         weight_granularity: str | None = None,
         experiment_config: dict | None = None,
+        freeze_visual_layers: tuple[int, ...] | list[int] = (),
         **kwargs,
     ) -> None:
         super().__init__(use_custom_prompt=True, **kwargs)
         self.model, self.processor, self.reference_conversion = load_reference(model_path)
+        self.freeze_visual_layers = tuple(sorted(set(
+            int(index) for index in freeze_visual_layers
+        )))
+        if any(index < 0 or index >= 36 for index in self.freeze_visual_layers):
+            raise ValueError(
+                f"freeze visual layer indices out of range: {self.freeze_visual_layers}"
+            )
+        self.freeze_generation_audit = {"prefill_calls": 0, "decode_calls": 0}
         method_name, quant_scope = MethodName(method), QuantScope(scope)
         activation = activation_bits
         if activation is None and method_name in {
@@ -165,6 +178,8 @@ class Qwen25VLQuantized(Qwen2VLPromptMixin, BaseModel):
                         min_pixels=min_pixels,
                         max_pixels=max_pixels,
                         attention_implementation=calibration_attention,
+                        modality_mode=self.quant_config.mbq_modality_mode,
+                        algorithm_version=self.quant_config.mbq_algorithm_version,
                     ),
                     reservoir_rows=32,
                     attention_implementation=calibration_attention,
@@ -221,11 +236,37 @@ class Qwen25VLQuantized(Qwen2VLPromptMixin, BaseModel):
             text=[text], images=image_inputs, videos=video_inputs,
             padding=True, return_tensors="pt",
         )
+        image_token = getattr(self.processor, "image_token_id", None)
+        if image_token is None:
+            image_token = getattr(self.model.config, "image_token_id", None)
+        if self.freeze_visual_layers and image_token is None:
+            raise ValueError("cannot identify the image token for visual freezing")
+        vision_mask = (
+            inputs.input_ids.eq(int(image_token))
+            if self.freeze_visual_layers else None
+        )
+        layers = decoder_layers(self.model)
         with torch.inference_mode():
-            output = self.model.generate(
-                **inputs, do_sample=False,
-                max_new_tokens=self.quant_config.max_new_tokens,
-            )
+            if self.freeze_visual_layers:
+                with temporary_generation_token_group_freeze(
+                    layers, self.freeze_visual_layers, vision_mask,
+                ) as audit:
+                    output = self.model.generate(
+                        **inputs, do_sample=False,
+                        max_new_tokens=self.quant_config.max_new_tokens,
+                    )
+                if audit["prefill_calls"] != len(self.freeze_visual_layers):
+                    raise RuntimeError(
+                        "visual freeze did not run exactly once per layer during prefill: "
+                        f"{audit}"
+                    )
+                for key, value in audit.items():
+                    self.freeze_generation_audit[key] += value
+            else:
+                output = self.model.generate(
+                    **inputs, do_sample=False,
+                    max_new_tokens=self.quant_config.max_new_tokens,
+                )
         trimmed = output[:, inputs.input_ids.shape[-1]:]
         return self.processor.batch_decode(
             trimmed, skip_special_tokens=True,

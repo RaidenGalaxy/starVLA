@@ -25,6 +25,9 @@ from .mbq import (
     mbq_calibration_batches,
     mbq_statistics_cache_key,
 )
+from .vg_qig_mbq import (
+    collect_vg_qig_search_cached, vg_cache_key, vg_vulnerability_cache_key,
+)
 from .provenance import completed_run, mark_complete
 from .reporting import atomic_json, write_report
 from .selection import inventory, select_linears
@@ -32,6 +35,8 @@ from .selection import inventory, select_linears
 
 CALIBRATION_METHODS = {
     MethodName.MBQ,
+    MethodName.VG_QIG_MBQ,
+    MethodName.VG_UNIFORM_MBQ,
     MethodName.AWQ,
     MethodName.GPTQ,
     MethodName.SMOOTHQUANT,
@@ -172,7 +177,9 @@ def run_config(
             calibration_samples[:config.calibration_samples]
         )
         cache_root = calibration_cache_dir or output_dir.parent / "_calibration_cache"
-        if config.method == MethodName.MBQ:
+        if config.method in {
+            MethodName.MBQ, MethodName.VG_QIG_MBQ, MethodName.VG_UNIFORM_MBQ,
+        }:
             calibration_attention = "sdpa"
             cache_key = mbq_cache_key(
                 model_revision=input_digests["model"],
@@ -182,7 +189,7 @@ def run_config(
                 reservoir_rows=32,
                 attention_implementation=calibration_attention,
             )
-            stats, cache_hit = collect_mbq_search_cached(
+            base_stats, base_cache_hit = collect_mbq_search_cached(
                 model,
                 selected,
                 mbq_calibration_batches(
@@ -203,10 +210,33 @@ def run_config(
                     min_pixels=config.min_pixels,
                     max_pixels=config.max_pixels,
                     attention_implementation=calibration_attention,
+                    modality_mode=config.mbq_modality_mode,
+                    algorithm_version=config.mbq_algorithm_version,
                 ),
                 reservoir_rows=32,
                 attention_implementation=calibration_attention,
             )
+            if config.method == MethodName.MBQ:
+                stats, cache_hit = base_stats, base_cache_hit
+            else:
+                vg_key = vg_cache_key(
+                    model_revision=input_digests["model"],
+                    calibration_digest=calibration_subset_digest,
+                    selected_names=[item.name for item in selected],
+                    config=config,
+                )
+                stats, vg_cache_hit = collect_vg_qig_search_cached(
+                    model, selected, processor,
+                    calibration_samples[:config.calibration_samples],
+                    config, base_stats, cache_dir=cache_root, key=vg_key,
+                    vulnerability_key=vg_vulnerability_cache_key(
+                        model_revision=input_digests["model"],
+                        calibration_digest=calibration_subset_digest,
+                        selected_names=[item.name for item in selected],
+                        config=config,
+                    ),
+                )
+                cache_hit = base_cache_hit and vg_cache_hit
         else:
             cache_key = calibration_cache_key(
                 model_revision=input_digests["model"],

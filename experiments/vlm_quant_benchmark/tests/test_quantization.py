@@ -10,7 +10,7 @@ from experiments.vlm_quant_benchmark.quantization import (
 )
 
 
-@pytest.mark.parametrize("bits,qmax", [(3, 7), (4, 15), (8, 255)])
+@pytest.mark.parametrize("bits,qmax", [(2, 3), (3, 7), (4, 15), (8, 255)])
 def test_asymmetric_ranges_tail_and_determinism(bits, qmax):
     weight = torch.linspace(-3, 2, 2 * 131).reshape(2, 131)
     first = quantize_weight_groupwise(weight, bits=bits, group_size=128, zero_point=True)
@@ -21,7 +21,7 @@ def test_asymmetric_ranges_tail_and_determinism(bits, qmax):
     torch.testing.assert_close(first.dequantized, second.dequantized, rtol=0, atol=0)
 
 
-@pytest.mark.parametrize("bits,qmax", [(3, 3), (4, 7), (8, 127)])
+@pytest.mark.parametrize("bits,qmax", [(2, 1), (3, 3), (4, 7), (8, 127)])
 def test_symmetric_ranges(bits, qmax):
     weight = torch.randn(3, 129)
     result = quantize_weight_groupwise(weight, bits=bits, group_size=128, zero_point=False)

@@ -172,6 +172,8 @@ def main() -> None:
             min_pixels=mbq_config.min_pixels,
             max_pixels=mbq_config.max_pixels,
             attention_implementation="sdpa",
+            modality_mode=mbq_config.mbq_modality_mode,
+            algorithm_version=mbq_config.mbq_algorithm_version,
         ),
         reservoir_rows=32,
         attention_implementation="sdpa",

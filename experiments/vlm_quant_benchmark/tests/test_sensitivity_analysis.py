@@ -25,10 +25,19 @@ from experiments.vlm_quant_benchmark.promotion import rank_promotion_variants
 from experiments.vlm_quant_benchmark.residuals import (
     aggregate_mbq_block_rms,
     capture_reconstruction_outputs,
+    prediction_change_summary,
     reconstruction_rows,
     residual_summary,
 )
 from experiments.vlm_quant_benchmark.run_sensitivity_ablation import ablation_configs
+from experiments.vlm_quant_benchmark.run_mbq_trimodal_formal import (
+    _paired_effect,
+    trimodal_configs,
+)
+from experiments.vlm_quant_benchmark.run_mbq_factorial_formal import (
+    factorial_configs,
+    factorial_contrast_values,
+)
 from experiments.vlm_quant_benchmark.second_wave_methods import squeezellm_linear
 from experiments.vlm_quant_benchmark.calibration import ActivationStats
 from experiments.vlm_quant_benchmark.selection import select_linears
@@ -371,3 +380,125 @@ def test_attribution_keeps_indistinguishable_w4_conclusion():
     assert decision["motivation_supported"]
     assert decision["w4_paired_ci_contains_zero"]
     assert decision["conclusion"] == "没有证据证明MBQ整体泛化更差"
+
+
+
+def test_trimodal_formal_configs_share_raw_cache_but_isolate_search():
+    configs = trimodal_configs(calibration_samples=128, seed=42)
+    no_floor = configs["mbq_trimodal_no_floor"]
+    floor = configs["mbq_trimodal_floor"]
+    assert no_floor.mbq_modality_mode == "vision_prompt_answer"
+    assert floor.mbq_algorithm_version == 5
+    assert not no_floor.mbq_median_floor and floor.mbq_median_floor
+    raw_kwargs = {
+        "model_revision": "model",
+        "calibration_digest": "calibration",
+        "selected_names": ["model.layers.0.self_attn.q_proj"],
+        "reservoir_rows": 32,
+        "seed": 42,
+        "min_pixels": no_floor.min_pixels,
+        "max_pixels": no_floor.max_pixels,
+        "attention_implementation": "sdpa",
+        "modality_mode": no_floor.mbq_modality_mode,
+        "algorithm_version": no_floor.mbq_algorithm_version,
+    }
+    assert mbq_statistics_cache_key(**raw_kwargs) == mbq_statistics_cache_key(**raw_kwargs)
+    search_kwargs = {
+        "model_revision": "model",
+        "calibration_digest": "calibration",
+        "selected_names": ["model.layers.0.self_attn.q_proj"],
+        "reservoir_rows": 32,
+        "attention_implementation": "sdpa",
+    }
+    assert mbq_cache_key(config=no_floor, **search_kwargs) != mbq_cache_key(
+        config=floor, **search_kwargs,
+    )
+
+
+def test_trimodal_paired_effect_is_dataset_balanced_and_reproducible():
+    baseline = {}
+    rows = []
+    for dataset in ("a", "b", "c", "d"):
+        for index in range(2):
+            key = (dataset, f"{dataset}:{index}")
+            baseline[key] = 2.0 + index
+            rows.append({
+                "dataset": dataset,
+                "id": key[1],
+                "target_nll": baseline[key] - 0.1,
+            })
+    first = _paired_effect(
+        baseline,
+        rows,
+        bootstrap_samples=50,
+        seed=42,
+        variant="tri",
+        expected_per_dataset=2,
+    )
+    second = _paired_effect(
+        baseline,
+        rows,
+        bootstrap_samples=50,
+        seed=42,
+        variant="tri",
+        expected_per_dataset=2,
+    )
+    assert first == second
+    assert first["dataset_balanced_nll_improvement"] == pytest.approx(0.1)
+    assert first["paired_samples"] == 8
+
+
+
+def test_factorial_configs_cover_exact_2x2_without_floor():
+    configs = factorial_configs(calibration_samples=128, seed=42)
+    assert {
+        (
+            config.effective_mbq_activation_mode,
+            config.effective_mbq_objective_mode,
+        )
+        for config in configs.values()
+    } == {
+        ("vision_answer", "vision_answer"),
+        ("vision_prompt_answer", "vision_answer"),
+        ("vision_answer", "vision_prompt_answer"),
+        ("vision_prompt_answer", "vision_prompt_answer"),
+    }
+    assert all(
+        config.mbq_modality_mode == "vision_prompt_answer"
+        and config.mbq_algorithm_version == 5
+        and not config.mbq_median_floor
+        for config in configs.values()
+    )
+
+
+def test_factorial_contrast_values_have_registered_sign_convention():
+    effects = factorial_contrast_values({
+        "A_VA__O_VA": 1.0,
+        "A_VPA__O_VA": 2.0,
+        "A_VA__O_VPA": 3.0,
+        "A_VPA__O_VPA": 7.0,
+    })
+    assert effects == {
+        "activation_main_effect": 2.5,
+        "objective_main_effect": 3.5,
+        "activation_objective_interaction": 3.0,
+        "trimodal_endpoint_effect": 6.0,
+    }
+
+
+def test_prediction_change_summary_reports_kl_and_argmax_rate():
+    reference = torch.tensor([[
+        [3.0, 0.0], [0.0, 3.0], [2.0, 0.0], [0.0, 2.0],
+    ]])
+    identical = prediction_change_summary(
+        reference, reference.clone(), torch.tensor([[False, False, True, True]]),
+    )
+    assert identical["output_kl"] == pytest.approx(0.0)
+    assert identical["argmax_change_rate"] == pytest.approx(0.0)
+    candidate = reference.clone()
+    candidate[:, 1] = torch.tensor([4.0, 0.0])
+    changed = prediction_change_summary(
+        reference, candidate, torch.tensor([[False, False, True, True]]),
+    )
+    assert changed["output_kl"] > 0
+    assert changed["argmax_change_rate"] > 0

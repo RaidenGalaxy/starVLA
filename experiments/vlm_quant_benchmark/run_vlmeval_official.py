@@ -69,6 +69,10 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--judge-cache-dir", type=Path)
     parser.add_argument("--judge-model", default="gpt-4o-mini")
     parser.add_argument("--max-new-tokens", type=int, default=128)
+    parser.add_argument(
+        "--freeze-visual-layers", default="",
+        help="Comma-separated decoder layers whose visual rows are frozen during prefill.",
+    )
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--threads", type=int, default=16)
     parser.add_argument("--resume", action="store_true")
@@ -115,7 +119,10 @@ PREDICTION_COMPARABLE_FIELDS = (
     "mbq_reweight", "mbq_gradient_aggregation",
     "mbq_objective_normalization", "mbq_median_floor",
     "mbq_reconstruction_level", "mbq_algorithm_version",
+    "mbq_modality_mode", "mbq_activation_mode", "mbq_objective_mode",
+    "mbq_prompt_objective_scale",
     "squeezellm_sparse_fraction", "calibration_protocol",
+    "freeze_visual_layers",
 )
 
 
@@ -123,6 +130,10 @@ def comparable_config_value(payload: dict, key: str):
     value = payload.get(key)
     if key == "weight_granularity" and value is None:
         return "groupwise"
+    if key == "mbq_modality_mode" and value is None:
+        return "vision_answer"
+    if key == "mbq_prompt_objective_scale" and value is None:
+        return 1.0
     if key == "zero_point" and value is None:
         return (
             payload.get("weight_bits") is not None
@@ -408,6 +419,15 @@ def main() -> None:
 
     torch.set_num_threads(args.threads)
     torch.manual_seed(args.seed)
+    freeze_visual_layers = sorted({
+        int(value.strip())
+        for value in args.freeze_visual_layers.split(",")
+        if value.strip()
+    })
+    if any(index < 0 or index >= 36 for index in freeze_visual_layers):
+        raise ValueError(
+            f"--freeze-visual-layers contains an invalid index: {freeze_visual_layers}"
+        )
     validate_vlmevalkit(args.vlmevalkit_root)
     if args.calibration_manifest and args.screen_manifest:
         assert_disjoint(
@@ -468,6 +488,11 @@ def main() -> None:
         "vlmevalkit_revision": VLMEVALKIT_REVISION,
         "judge": None,
         "protocol_version": PROTOCOL_VERSION,
+        "freeze_visual_layers": freeze_visual_layers,
+        "visual_freeze_definition": (
+            "replace selected visual-token layer outputs with layer inputs during "
+            "prefill; leave cached one-token decoding unchanged"
+        ),
     }
     config_digest = sha256_json(config)
     digests = {
@@ -593,6 +618,7 @@ def main() -> None:
             experiment_config=(
                 experiment_config.to_dict() if experiment_config else None
             ),
+            freeze_visual_layers=freeze_visual_layers,
         )
         audit = (
             model.official_awq_audit if args.official_awq_path else model.applied.audit
@@ -774,6 +800,7 @@ def main() -> None:
                     MethodName.OMNIQUANT, MethodName.SPQR, MethodName.SQUEEZELLM
                 } else "local_algorithm_simulation"
             ),
+            "freeze_visual_layers": freeze_visual_layers,
             "logical_bits_per_weight": (
                 4.15625 if args.official_awq_path else
                 16.0 if method == MethodName.BF16_VALUE_FP32_COMPUTE else

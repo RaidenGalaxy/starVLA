@@ -31,6 +31,16 @@ from .selection import SelectedLinear
 UPSTREAM_REPOSITORY = "https://github.com/thu-nics/MBQ"
 UPSTREAM_COMMIT = "a4d460dfb4b1c07b5d1f3ddda6e86d1c90d6e7f1"
 FORMAT_VERSION = 4
+TWO_MODALITIES = ("vision", "answer_language")
+THREE_MODALITIES = ("vision", "prompt_language", "answer_language")
+
+
+def enabled_modalities(mode: str) -> tuple[str, ...]:
+    if mode == "vision_answer":
+        return TWO_MODALITIES
+    if mode == "vision_prompt_answer":
+        return THREE_MODALITIES
+    raise ValueError(f"unsupported MBQ modality mode: {mode}")
 
 
 @dataclasses.dataclass
@@ -39,6 +49,26 @@ class ModalityActivationStats:
     language: torch.Tensor
     vision_rows: int
     language_rows: int
+    prompt_language: torch.Tensor | None = None
+    prompt_language_rows: int = 0
+
+    def value(self, modality: str) -> torch.Tensor:
+        if modality == "vision":
+            return self.vision
+        if modality == "answer_language":
+            return self.language
+        if modality == "prompt_language" and self.prompt_language is not None:
+            return self.prompt_language
+        raise KeyError(f"missing MBQ activation modality: {modality}")
+
+    def row_count(self, modality: str) -> int:
+        if modality == "vision":
+            return self.vision_rows
+        if modality == "answer_language":
+            return self.language_rows
+        if modality == "prompt_language" and self.prompt_language is not None:
+            return self.prompt_language_rows
+        raise KeyError(f"missing MBQ activation row count: {modality}")
 
 
 @dataclasses.dataclass
@@ -52,6 +82,9 @@ class MBQRawStatistics:
     stats: dict[str, ModalityActivationStats]
     gradient_records: dict[str, list[dict]]
     token_counts: dict
+
+    modality_mode: str = "vision_answer"
+    algorithm_version: int = 4
 
 
 def mbq_cache_key(
@@ -90,6 +123,15 @@ def mbq_cache_key(
         "seed": config.seed,
         "attention_implementation": attention_implementation,
     }
+    # Preserve the exact v4/two-modal cache key while isolating every v5 artifact.
+    if config.mbq_modality_mode != "vision_answer" or config.mbq_algorithm_version != 4:
+        payload["modality_mode"] = config.mbq_modality_mode
+        payload["algorithm_version"] = config.mbq_algorithm_version
+    if config.mbq_activation_mode is not None or config.mbq_objective_mode is not None:
+        payload["activation_mode"] = config.effective_mbq_activation_mode
+        payload["objective_mode"] = config.effective_mbq_objective_mode
+    if config.mbq_prompt_objective_scale != 1.0:
+        payload["prompt_objective_scale"] = config.mbq_prompt_objective_scale
     serialized = json.dumps(payload, sort_keys=True, separators=(",", ":"))
     return hashlib.sha256(serialized.encode()).hexdigest()
 
@@ -104,6 +146,8 @@ def mbq_statistics_cache_key(
     min_pixels: int,
     max_pixels: int,
     attention_implementation: str,
+    modality_mode: str = "vision_answer",
+    algorithm_version: int = 4,
 ) -> str:
     """Key expensive raw MBQ observations independently of search variants."""
     payload = {
@@ -119,6 +163,9 @@ def mbq_statistics_cache_key(
         "max_pixels": max_pixels,
         "attention_implementation": attention_implementation,
     }
+    if modality_mode != "vision_answer" or algorithm_version != 4:
+        payload["modality_mode"] = modality_mode
+        payload["algorithm_version"] = algorithm_version
     serialized = json.dumps(payload, sort_keys=True, separators=(",", ":"))
     return hashlib.sha256(serialized.encode()).hexdigest()
 
@@ -154,9 +201,14 @@ def mbq_calibration_batches(processor, samples, *, min_pixels: int, max_pixels: 
         for special_id in tokenizer.all_special_ids:
             prompt_mask &= teacher["input_ids"].ne(int(special_id))
         prompt_mask &= ~vision_mask
+        prompt_mask &= ~language_mask
         if not vision_mask.any() or not language_mask.any():
             raise ValueError(f"MBQ sample {sample.id} has an empty modality mask")
-        if (vision_mask & language_mask).any():
+        if (
+            (vision_mask & language_mask).any()
+            or (vision_mask & prompt_mask).any()
+            or (language_mask & prompt_mask).any()
+        ):
             raise ValueError(f"MBQ sample {sample.id} has overlapping modality masks")
         model_inputs = dict(teacher)
         model_inputs["labels"] = labels
@@ -166,21 +218,30 @@ def mbq_calibration_batches(processor, samples, *, min_pixels: int, max_pixels: 
             "model_inputs": model_inputs,
             "vision_mask": vision_mask,
             "language_mask": language_mask,
+            "answer_language_mask": language_mask,
             "prompt_language_mask": prompt_mask,
         }
 
 
 class _ModalReservoir:
-    def __init__(self, selected: list[SelectedLinear], rows: int, seed: int) -> None:
+    def __init__(
+        self,
+        selected: list[SelectedLinear],
+        rows: int,
+        seed: int,
+        modalities: tuple[str, ...] = TWO_MODALITIES,
+    ) -> None:
         self.rows = rows
+        self.modalities = modalities
         self.values: dict[tuple[str, str], torch.Tensor] = {}
         self.priorities: dict[tuple[str, str], torch.Tensor] = {}
         self.counts: dict[tuple[str, str], int] = defaultdict(int)
         self.generators = {}
         for item in selected:
-            for modality in ("vision", "language"):
+            for modality in modalities:
+                seed_modality = "language" if modality == "answer_language" else modality
                 digest = hashlib.sha256(
-                    f"{seed}:{item.name}:{modality}".encode()
+                    f"{seed}:{item.name}:{seed_modality}".encode()
                 ).digest()
                 generator = torch.Generator(device="cpu")
                 generator.manual_seed(int.from_bytes(digest[:8], "little") % (2**63 - 1))
@@ -206,15 +267,20 @@ class _ModalReservoir:
     def finish(self, selected: list[SelectedLinear]) -> dict[str, ModalityActivationStats]:
         result = {}
         for item in selected:
-            vision = self.values.get((item.name, "vision"))
-            language = self.values.get((item.name, "language"))
-            if vision is None or language is None:
-                raise RuntimeError(f"MBQ did not observe both modalities at {item.name}")
+            observed = {
+                modality: self.values.get((item.name, modality))
+                for modality in self.modalities
+            }
+            missing = [name for name, value in observed.items() if value is None]
+            if missing:
+                raise RuntimeError(f"MBQ did not observe {missing} at {item.name}")
             result[item.name] = ModalityActivationStats(
-                vision=vision,
-                language=language,
+                vision=observed["vision"],
+                language=observed["answer_language"],
                 vision_rows=self.counts[(item.name, "vision")],
-                language_rows=self.counts[(item.name, "language")],
+                language_rows=self.counts[(item.name, "answer_language")],
+                prompt_language=observed.get("prompt_language"),
+                prompt_language_rows=self.counts[(item.name, "prompt_language")],
             )
         return result
 
@@ -262,45 +328,81 @@ def _group_kind(name: str) -> str:
     raise ValueError(f"unsupported MBQ decoder projection: {name}")
 
 
+def _gradient_modality_record(row: dict, modality: str) -> dict:
+    nested = row.get("modalities")
+    if nested is not None:
+        if modality not in nested:
+            raise RuntimeError(f"MBQ gradient record is missing {modality}")
+        return nested[modality]
+    legacy = "language" if modality == "answer_language" else modality
+    return {
+        "sum": row[f"{legacy}_sum"],
+        "count": row[f"{legacy}_count"],
+        "mean": row[f"{legacy}_mean"],
+    }
+
+
+def aggregate_gradient_weights(
+    records: dict[str, list[dict]],
+    mode: str,
+    *,
+    modalities: tuple[str, ...] = THREE_MODALITIES,
+    reference: str = "answer_language",
+) -> dict[str, dict[str, float]]:
+    """Aggregate per-sample gradients and normalize every modality to reference."""
+    if reference not in modalities:
+        raise ValueError("MBQ reference modality must be enabled")
+    weights = {}
+    for name, rows in records.items():
+        if not rows:
+            raise RuntimeError(f"MBQ has no gradient records at {name}")
+        means = {}
+        for modality in modalities:
+            if mode == "pooled_elements":
+                total = sum(
+                    _gradient_modality_record(row, modality)["sum"] for row in rows
+                )
+                count = sum(
+                    _gradient_modality_record(row, modality)["count"] for row in rows
+                )
+                value = total / count if count else 0.0
+            elif mode == "sample_mean":
+                value = statistics.fmean(
+                    _gradient_modality_record(row, modality)["mean"] for row in rows
+                )
+            elif mode == "source_balanced":
+                sources = sorted({row["source"] for row in rows})
+                value = statistics.fmean(
+                    statistics.fmean(
+                        _gradient_modality_record(row, modality)["mean"]
+                        for row in rows if row["source"] == source
+                    )
+                    for source in sources
+                )
+            else:
+                raise ValueError(f"unsupported MBQ gradient aggregation: {mode}")
+            if not torch.isfinite(torch.tensor(value)):
+                raise RuntimeError(f"non-finite MBQ {modality} gradient at {name}")
+            means[modality] = float(value)
+        denominator = means[reference]
+        if denominator <= 0:
+            raise RuntimeError(f"MBQ {reference} gradient is zero at {name}")
+        weights[name] = {
+            modality: (1.0 if modality == reference else means[modality] / denominator)
+            for modality in modalities
+        }
+    return weights
+
+
 def aggregate_gradient_ratios(
     records: dict[str, list[dict]],
     mode: str,
 ) -> dict[str, float]:
-    """Aggregate per-sample modality gradients using an explicit weighting rule."""
-    ratios = {}
-    for name, rows in records.items():
-        if not rows:
-            raise RuntimeError(f"MBQ has no gradient records at {name}")
-        if mode == "pooled_elements":
-            vision = sum(row["vision_sum"] for row in rows) / sum(
-                row["vision_count"] for row in rows
-            )
-            language = sum(row["language_sum"] for row in rows) / sum(
-                row["language_count"] for row in rows
-            )
-        elif mode == "sample_mean":
-            vision = statistics.fmean(row["vision_mean"] for row in rows)
-            language = statistics.fmean(row["language_mean"] for row in rows)
-        elif mode == "source_balanced":
-            sources = sorted({row["source"] for row in rows})
-            vision = statistics.fmean(
-                statistics.fmean(
-                    row["vision_mean"] for row in rows if row["source"] == source
-                )
-                for source in sources
-            )
-            language = statistics.fmean(
-                statistics.fmean(
-                    row["language_mean"] for row in rows if row["source"] == source
-                )
-                for source in sources
-            )
-        else:
-            raise ValueError(f"unsupported MBQ gradient aggregation: {mode}")
-        if language <= 0:
-            raise RuntimeError(f"MBQ language gradient is zero at {name}")
-        ratios[name] = vision / language
-    return ratios
+    """Compatibility wrapper for the original vision/answer MBQ ratio."""
+    weights = aggregate_gradient_weights(
+        records, mode, modalities=TWO_MODALITIES,
+    )
+    return {name: value["vision"] for name, value in weights.items()}
 
 
 def collect_mbq_raw_statistics(
@@ -311,13 +413,20 @@ def collect_mbq_raw_statistics(
     reservoir_rows: int,
     seed: int,
     attention_implementation: str = "sdpa",
+    modality_mode: str = "vision_answer",
+    algorithm_version: int = 4,
 ) -> MBQRawStatistics:
     """Collect reusable modality reservoirs and per-sample gradient records."""
     if not selected:
         raise ValueError("MBQ requires at least one selected decoder Linear")
+    modalities = enabled_modalities(modality_mode)
+    if modality_mode == "vision_prompt_answer" and algorithm_version != 5:
+        raise ValueError("three-token-class MBQ requires algorithm version 5")
     model.eval()
-    reservoirs = _ModalReservoir(selected, reservoir_rows, seed)
-    current_masks: dict[str, torch.Tensor | None] = {"vision": None, "language": None}
+    reservoirs = _ModalReservoir(selected, reservoir_rows, seed, modalities)
+    current_masks: dict[str, torch.Tensor | None] = {
+        modality: None for modality in modalities
+    }
     activation_handles = []
     captured: dict[str, torch.Tensor] = {}
     gradient_records: dict[str, list[dict]] = defaultdict(list)
@@ -327,7 +436,7 @@ def collect_mbq_raw_statistics(
             if not args or not isinstance(args[0], torch.Tensor):
                 return
             value = args[0]
-            for modality in ("vision", "language"):
+            for modality in modalities:
                 mask = current_masks[modality]
                 if mask is None or value.shape[:2] != mask.shape:
                     raise RuntimeError(f"MBQ mask/activation shape mismatch at {name}")
@@ -358,16 +467,47 @@ def collect_mbq_raw_statistics(
     original_requires_grad = [parameter.requires_grad for parameter in parameters]
     for parameter in parameters:
         parameter.requires_grad_(False)
-    token_counts = {"vision": 0, "language": 0, "samples": 0}
+    token_counts = (
+        {"vision": 0, "language": 0, "samples": 0}
+        if modality_mode == "vision_answer"
+        else {modality: 0 for modality in modalities} | {"samples": 0}
+    )
     try:
         with temporary_attention_implementation(model, attention_implementation):
             for batch in batches:
-                vision_mask = batch["vision_mask"].bool()
-                language_mask = batch["language_mask"].bool()
-                current_masks["vision"] = vision_mask
-                current_masks["language"] = language_mask
-                token_counts["vision"] += int(vision_mask.sum().item())
-                token_counts["language"] += int(language_mask.sum().item())
+                batch_masks = {
+                    "vision": batch["vision_mask"].bool(),
+                    "answer_language": batch.get(
+                        "answer_language_mask", batch["language_mask"],
+                    ).bool(),
+                }
+                if "prompt_language" in modalities:
+                    batch_masks["prompt_language"] = batch["prompt_language_mask"].bool()
+                shapes = {tuple(mask.shape) for mask in batch_masks.values()}
+                if len(shapes) != 1:
+                    raise RuntimeError(f"MBQ modality mask shape mismatch for {batch['id']}")
+                for modality in modalities:
+                    mask = batch_masks[modality]
+                    if not mask.any():
+                        raise ValueError(
+                            f"MBQ sample {batch['id']} has empty {modality} mask"
+                        )
+                    current_masks[modality] = mask
+                for left_index, left in enumerate(modalities):
+                    for right in modalities[left_index + 1:]:
+                        if (batch_masks[left] & batch_masks[right]).any():
+                            raise ValueError(
+                                f"MBQ sample {batch['id']} has overlapping "
+                                f"{left}/{right} masks"
+                            )
+                if modality_mode == "vision_answer":
+                    token_counts["vision"] += int(batch_masks["vision"].sum().item())
+                    token_counts["language"] += int(
+                        batch_masks["answer_language"].sum().item()
+                    )
+                else:
+                    for modality in modalities:
+                        token_counts[modality] += int(batch_masks[modality].sum().item())
                 token_counts["samples"] += 1
                 captured.clear()
                 with torch.enable_grad():
@@ -383,21 +523,41 @@ def collect_mbq_raw_statistics(
                         allow_unused=False,
                     )
                 for name, gradient in zip(names, gradients):
-                    vision_grad = gradient[vision_mask]
-                    language_grad = gradient[language_mask]
-                    if not vision_grad.numel() or not language_grad.numel():
-                        raise RuntimeError(f"MBQ has an empty gradient modality at {name}")
-                    vision_sum = float(vision_grad.abs().sum().item())
-                    language_sum = float(language_grad.abs().sum().item())
-                    gradient_records[name].append({
-                        "source": str(batch.get("source", "unknown")),
-                        "vision_sum": vision_sum,
-                        "vision_count": vision_grad.numel(),
-                        "vision_mean": vision_sum / vision_grad.numel(),
-                        "language_sum": language_sum,
-                        "language_count": language_grad.numel(),
-                        "language_mean": language_sum / language_grad.numel(),
-                    })
+                    modality_records = {}
+                    for modality in modalities:
+                        values = gradient[batch_masks[modality]]
+                        if not values.numel():
+                            raise RuntimeError(
+                                f"MBQ has an empty {modality} gradient at {name}"
+                            )
+                        absolute_sum = float(values.abs().sum().item())
+                        if not torch.isfinite(torch.tensor(absolute_sum)):
+                            raise ValueError(
+                                f"non-finite MBQ {modality} gradient at {name}"
+                            )
+                        modality_records[modality] = {
+                            "sum": absolute_sum,
+                            "count": values.numel(),
+                            "mean": absolute_sum / values.numel(),
+                        }
+                    if modality_mode == "vision_answer":
+                        vision = modality_records["vision"]
+                        language = modality_records["answer_language"]
+                        record = {
+                            "source": str(batch.get("source", "unknown")),
+                            "vision_sum": vision["sum"],
+                            "vision_count": vision["count"],
+                            "vision_mean": vision["mean"],
+                            "language_sum": language["sum"],
+                            "language_count": language["count"],
+                            "language_mean": language["mean"],
+                        }
+                    else:
+                        record = {
+                            "source": str(batch.get("source", "unknown")),
+                            "modalities": modality_records,
+                        }
+                    gradient_records[name].append(record)
                 del output, gradients, batch
                 captured.clear()
                 release_cpu_memory()
@@ -407,13 +567,15 @@ def collect_mbq_raw_statistics(
             handle.remove()
         for parameter, required in zip(parameters, original_requires_grad):
             parameter.requires_grad_(required)
-        current_masks["vision"] = None
-        current_masks["language"] = None
+        for modality in modalities:
+            current_masks[modality] = None
 
     return MBQRawStatistics(
         stats=reservoirs.finish(selected),
         gradient_records=dict(gradient_records),
         token_counts=token_counts,
+        modality_mode=modality_mode,
+        algorithm_version=algorithm_version,
     )
 
 
@@ -426,7 +588,9 @@ def collect_mbq_statistics(
     seed: int,
     attention_implementation: str = "sdpa",
     gradient_aggregation: str = "pooled_elements",
-) -> tuple[dict[str, ModalityActivationStats], dict[str, float], dict]:
+    modality_mode: str = "vision_answer",
+    algorithm_version: int = 4,
+) -> tuple[dict[str, ModalityActivationStats], dict, dict]:
     """Compatibility wrapper returning aggregated MBQ statistics."""
     raw = collect_mbq_raw_statistics(
         model,
@@ -435,11 +599,20 @@ def collect_mbq_statistics(
         reservoir_rows=reservoir_rows,
         seed=seed,
         attention_implementation=attention_implementation,
+        modality_mode=modality_mode,
+        algorithm_version=algorithm_version,
     )
-    ratios = aggregate_gradient_ratios(raw.gradient_records, gradient_aggregation)
+    if modality_mode == "vision_answer":
+        weights = aggregate_gradient_ratios(raw.gradient_records, gradient_aggregation)
+    else:
+        weights = aggregate_gradient_weights(
+            raw.gradient_records,
+            gradient_aggregation,
+            modalities=enabled_modalities(modality_mode),
+        )
     counts = dict(raw.token_counts)
     counts["gradient_aggregation"] = gradient_aggregation
-    return raw.stats, ratios, counts
+    return raw.stats, weights, counts
 
 
 def _effective_group_size(source: nn.Linear, config: ExperimentConfig) -> int:
@@ -450,9 +623,17 @@ def _candidate_error(
     modules: list[SelectedLinear],
     stats: ModalityActivationStats,
     scale: torch.Tensor,
-    ratio: float,
+    ratio: float | dict[str, float],
     config: ExperimentConfig,
 ) -> tuple[float, dict]:
+    modalities = enabled_modalities(config.effective_mbq_objective_mode)
+    weights = (
+        {"vision": float(ratio), "answer_language": 1.0}
+        if isinstance(ratio, (float, int)) else dict(ratio)
+    )
+    weights = {modality: float(weights[modality]) for modality in modalities}
+    if set(weights) != set(modalities):
+        raise ValueError("MBQ candidate weights do not match enabled modalities")
     numerator = 0.0
     denominator = 0.0
     module_errors = {}
@@ -466,8 +647,8 @@ def _candidate_error(
             zero_point=config.zero_point,
         )
         errors = {}
-        for modality, weight in (("language", 1.0), ("vision", ratio)):
-            value = getattr(stats, modality).float()
+        for modality in modalities:
+            value = stats.value(modality).float()
             reference = F.linear(value, source.weight.detach().float(), source.bias)
             candidate_input = value / scale
             if config.activation_bits is not None:
@@ -476,16 +657,19 @@ def _candidate_error(
                 )
             candidate = F.linear(candidate_input, quantized.dequantized, source.bias)
             absolute = (reference - candidate).abs()
-            errors[modality] = float(absolute.mean().item())
+            audit_name = (
+                "language"
+                if config.effective_mbq_objective_mode == "vision_answer"
+                and modality == "answer_language"
+                else modality
+            )
+            errors[audit_name] = float(absolute.mean().item())
             if config.mbq_objective_normalization == "token_weighted":
-                original_rows = getattr(stats, f"{modality}_rows")
-                objective_values = original_rows * absolute.shape[-1]
+                objective_values = stats.row_count(modality) * absolute.shape[-1]
             else:
                 objective_values = 1.0
-            numerator += weight * errors[modality] * objective_values
+            numerator += weights[modality] * errors[audit_name] * objective_values
             # Upstream MBQ weights the modality error sum, not its normalizer.
-            # Keeping this denominator unweighted also makes audit loss values
-            # comparable across reweighting ablations.
             denominator += objective_values
         module_errors[item.name] = errors
     return numerator / max(denominator, 1), module_errors
@@ -494,7 +678,7 @@ def _candidate_error(
 def search_mbq_scales(
     selected: list[SelectedLinear],
     stats: dict[str, ModalityActivationStats],
-    raw_ratios: dict[str, float],
+    raw_ratios: dict[str, float] | dict[str, dict[str, float]],
     config: ExperimentConfig,
     token_counts: dict,
 ) -> MBQSearchResult:
@@ -506,15 +690,43 @@ def search_mbq_scales(
             "exact block-output reconstruction requires a separate backend; "
             "refusing to label linear-group reconstruction as block-output"
         )
-    anchor_ratios: dict[tuple[str, str], float] = {}
-    by_kind: dict[str, list[float]] = {"attention": [], "mlp": []}
-    for name, ratio in raw_ratios.items():
+    collection_modalities = enabled_modalities(config.mbq_modality_mode)
+    activation_modalities = enabled_modalities(config.effective_mbq_activation_mode)
+    objective_modalities = enabled_modalities(config.effective_mbq_objective_mode)
+    non_reference = tuple(
+        modality for modality in objective_modalities
+        if modality != "answer_language"
+    )
+    normalized_weights = {}
+    for name, value in raw_ratios.items():
+        if isinstance(value, dict):
+            weights = {
+                modality: float(value[modality]) for modality in collection_modalities
+            }
+        else:
+            if config.mbq_modality_mode != "vision_answer":
+                raise ValueError("three-token-class MBQ requires per-modality weights")
+            weights = {"vision": float(value), "answer_language": 1.0}
+        if any(not torch.isfinite(torch.tensor(weight)) for weight in weights.values()):
+            raise ValueError(f"non-finite MBQ gradient weight at {name}")
+        normalized_weights[name] = weights
+
+    anchor_weights: dict[tuple[str, str], dict[str, float]] = {}
+    by_kind = {
+        kind: {modality: [] for modality in non_reference}
+        for kind in ("attention", "mlp")
+    }
+    for name, weights in normalized_weights.items():
         kind = _sensitivity_kind(name)
-        anchor_ratios[(_block_identity(name), kind)] = float(ratio)
-        by_kind[kind].append(float(ratio))
+        anchor_weights[(_block_identity(name), kind)] = weights
+        for modality in non_reference:
+            by_kind[kind][modality].append(weights[modality])
     medians = {
-        kind: statistics.median(values) if values else 1.0
-        for kind, values in by_kind.items()
+        kind: {
+            modality: statistics.median(values) if values else 1.0
+            for modality, values in modality_values.items()
+        }
+        for kind, modality_values in by_kind.items()
     }
     groups: dict[tuple[str, str], list[SelectedLinear]] = defaultdict(list)
     for item in selected:
@@ -523,15 +735,27 @@ def search_mbq_scales(
     scales, group_audit = {}, {}
     for (block, group_kind), modules in sorted(groups.items()):
         sensitivity = "attention" if group_kind.startswith("attention") else "mlp"
-        raw_ratio = anchor_ratios.get((block, sensitivity))
-        if raw_ratio is None:
+        raw_weights = anchor_weights.get((block, sensitivity))
+        if raw_weights is None:
             raise RuntimeError(f"missing MBQ {sensitivity} sensitivity for {block}")
         if not config.mbq_reweight:
-            ratio = 1.0
-        elif config.mbq_median_floor:
-            ratio = max(raw_ratio, medians[sensitivity])
+            base_effective_weights = {
+                modality: 1.0 for modality in objective_modalities
+            }
         else:
-            ratio = raw_ratio
+            base_effective_weights = {
+                modality: raw_weights[modality] for modality in objective_modalities
+            }
+            if config.mbq_median_floor:
+                for modality in non_reference:
+                    base_effective_weights[modality] = max(
+                        raw_weights[modality], medians[sensitivity][modality],
+                    )
+        effective_weights = dict(base_effective_weights)
+        if "prompt_language" in effective_weights:
+            effective_weights["prompt_language"] *= (
+                config.mbq_prompt_objective_scale
+            )
         modules = sorted(modules, key=lambda item: item.name)
         representative = next(
             (
@@ -541,18 +765,26 @@ def search_mbq_scales(
             modules[0],
         )
         modality_stats = stats[representative.name]
-        activation = (
-            modality_stats.vision.abs().mean(dim=0) * modality_stats.vision_rows
-            + modality_stats.language.abs().mean(dim=0) * modality_stats.language_rows
-        ) / (modality_stats.vision_rows + modality_stats.language_rows)
+        total_rows = sum(
+            modality_stats.row_count(modality) for modality in activation_modalities
+        )
+        activation_contributions = {
+            modality: modality_stats.value(modality).abs().mean(dim=0)
+            * modality_stats.row_count(modality)
+            for modality in activation_modalities
+        }
+        activation = sum(activation_contributions.values()) / total_rows
         activation = activation.clamp_min(1e-4)
+        activation_digest = hashlib.sha256(
+            activation.contiguous().numpy().tobytes()
+        ).hexdigest()
         best = None
         history = []
         for alpha in config.mbq_scale_grid:
             scale = activation.pow(alpha).clamp_min(1e-4)
             scale = scale / torch.sqrt(scale.max() * scale.min())
             loss, module_errors = _candidate_error(
-                modules, modality_stats, scale, ratio, config,
+                modules, modality_stats, scale, effective_weights, config,
             )
             history.append({
                 "alpha": alpha,
@@ -567,27 +799,71 @@ def search_mbq_scales(
             if item.module.in_features != scale.numel():
                 raise RuntimeError(f"shared MBQ scale shape mismatch at {item.name}")
             scales[item.name] = scale.clone()
-        group_audit[f"{block}:{group_kind}"] = {
+        weighted_masses = {
+            modality: effective_weights[modality] * modality_stats.row_count(modality)
+            for modality in objective_modalities
+        }
+        mass_denominator = sum(weighted_masses.values())
+        audit = {
             "modules": [item.name for item in modules],
             "sensitivity_kind": sensitivity,
-            "raw_vision_to_language_gradient_ratio": raw_ratio,
-            "median_floor": medians[sensitivity],
-            "effective_ratio": ratio,
-            "vision_mass_share": (
-                ratio * modality_stats.vision_rows
-                / (
-                    ratio * modality_stats.vision_rows
-                    + modality_stats.language_rows
-                )
-            ),
+            "raw_modality_gradient_weights": raw_weights,
+            "median_floor_by_modality": medians[sensitivity],
+            "pre_prompt_scale_modality_weights": base_effective_weights,
+            "effective_modality_weights": effective_weights,
+            "prompt_objective_scale": config.mbq_prompt_objective_scale,
+            "modality_rows": {
+                modality: modality_stats.row_count(modality)
+                for modality in objective_modalities
+            },
+            "modality_mass_share": {
+                modality: value / mass_denominator
+                for modality, value in weighted_masses.items()
+            },
             "selected_alpha": alpha,
             "weighted_mae": loss,
             "history": history,
+            "activation_modalities": list(activation_modalities),
+            "activation_rows": {
+                modality: modality_stats.row_count(modality)
+                for modality in activation_modalities
+            },
+            "activation_row_share": {
+                modality: modality_stats.row_count(modality) / total_rows
+                for modality in activation_modalities
+            },
+            "activation_digest": activation_digest,
+            "activation_min": float(activation.min().item()),
+            "activation_max": float(activation.max().item()),
+            "activation_mean": float(activation.mean().item()),
         }
+        if config.effective_mbq_objective_mode == "vision_answer":
+            audit.update({
+                "raw_vision_to_language_gradient_ratio": raw_weights["vision"],
+                "median_floor": medians[sensitivity]["vision"],
+                "effective_ratio": effective_weights["vision"],
+                "vision_mass_share": audit["modality_mass_share"]["vision"],
+            })
+        group_audit[f"{block}:{group_kind}"] = audit
 
+    audit_medians = (
+        {kind: value["vision"] for kind, value in medians.items()}
+        if config.effective_mbq_objective_mode == "vision_answer" else medians
+    )
+    audit_raw = (
+        {name: value["vision"] for name, value in normalized_weights.items()}
+        if config.effective_mbq_objective_mode == "vision_answer" else normalized_weights
+    )
     return MBQSearchResult(scales=scales, audit={
         "format_version": FORMAT_VERSION,
         "algorithm": "modality_balanced_decoder_group_reconstruction",
+        "algorithm_version": config.mbq_algorithm_version,
+        "modality_mode": config.mbq_modality_mode,
+        "raw_collection_mode": config.mbq_modality_mode,
+        "activation_mode": config.effective_mbq_activation_mode,
+        "objective_mode": config.effective_mbq_objective_mode,
+        "enabled_modalities": list(objective_modalities),
+        "reference_modality": "answer_language",
         "reconstruction_level": "decoder_linear_group",
         "upstream_repository": UPSTREAM_REPOSITORY,
         "upstream_commit": UPSTREAM_COMMIT,
@@ -597,10 +873,11 @@ def search_mbq_scales(
         "distort": config.mbq_distort,
         "gradient_aggregation": config.mbq_gradient_aggregation,
         "objective_normalization": config.mbq_objective_normalization,
+        "prompt_objective_scale": config.mbq_prompt_objective_scale,
         "median_floor_enabled": config.mbq_median_floor,
         "token_counts": token_counts,
-        "gradient_ratio_medians": medians,
-        "raw_gradient_ratios": raw_ratios,
+        "gradient_ratio_medians": audit_medians,
+        "raw_gradient_ratios": audit_raw,
         "groups": group_audit,
         "deployment_kernel_claim": False,
         "compressed_resident_memory_claim": False,
@@ -643,15 +920,26 @@ def save_mbq_raw_statistics(
     path: Path, *, key: str, raw: MBQRawStatistics,
 ) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
+    tri_modal = raw.modality_mode == "vision_prompt_answer"
     payload = {
         "format_version": FORMAT_VERSION,
         "key": key,
+        "stats_schema_version": 5 if tri_modal else 4,
+        "modality_mode": raw.modality_mode,
+        "algorithm_version": raw.algorithm_version,
         "stats": {
             name: {
                 "vision": value.vision,
                 "language": value.language,
                 "vision_rows": value.vision_rows,
                 "language_rows": value.language_rows,
+                **(
+                    {
+                        "prompt_language": value.prompt_language,
+                        "prompt_language_rows": value.prompt_language_rows,
+                    }
+                    if tri_modal else {}
+                ),
             }
             for name, value in raw.stats.items()
         },
@@ -664,12 +952,26 @@ def save_mbq_raw_statistics(
 
 
 def load_mbq_raw_statistics(
-    path: Path, *, key: str, selected: list[SelectedLinear],
+    path: Path,
+    *,
+    key: str,
+    selected: list[SelectedLinear],
+    modality_mode: str = "vision_answer",
+    algorithm_version: int = 4,
 ) -> MBQRawStatistics | None:
     if not path.is_file():
         return None
     payload = torch.load(path, map_location="cpu", weights_only=True)
     if payload.get("format_version") != FORMAT_VERSION or payload.get("key") != key:
+        return None
+    if modality_mode == "vision_prompt_answer":
+        if (
+            payload.get("stats_schema_version") != 5
+            or payload.get("modality_mode") != modality_mode
+            or payload.get("algorithm_version") != algorithm_version
+        ):
+            return None
+    elif payload.get("modality_mode", "vision_answer") != "vision_answer":
         return None
     names = {item.name for item in selected}
     serialized = payload.get("stats", {})
@@ -683,12 +985,13 @@ def load_mbq_raw_statistics(
     for item in selected:
         value = serialized[item.name]
         vision, language = value["vision"], value["language"]
+        prompt = value.get("prompt_language")
+        tensors = [vision, language] + ([prompt] if prompt is not None else [])
         if (
-            vision.ndim != 2 or language.ndim != 2
-            or vision.shape[1] != item.module.in_features
-            or language.shape[1] != item.module.in_features
-            or not torch.isfinite(vision).all()
-            or not torch.isfinite(language).all()
+            any(tensor.ndim != 2 for tensor in tensors)
+            or any(tensor.shape[1] != item.module.in_features for tensor in tensors)
+            or any(not torch.isfinite(tensor).all() for tensor in tensors)
+            or (modality_mode == "vision_prompt_answer" and prompt is None)
         ):
             return None
         stats[item.name] = ModalityActivationStats(
@@ -696,11 +999,15 @@ def load_mbq_raw_statistics(
             language=language,
             vision_rows=int(value["vision_rows"]),
             language_rows=int(value["language_rows"]),
+            prompt_language=prompt,
+            prompt_language_rows=int(value.get("prompt_language_rows", 0)),
         )
     return MBQRawStatistics(
         stats=stats,
         gradient_records=records,
         token_counts=payload["token_counts"],
+        modality_mode=payload.get("modality_mode", "vision_answer"),
+        algorithm_version=int(payload.get("algorithm_version", 4)),
     )
 
 
@@ -711,6 +1018,7 @@ def collect_mbq_search_cached(
     config: ExperimentConfig,
     *,
     cache_dir: Path,
+    raw_cache_dir: Path | None = None,
     key: str,
     raw_key: str | None = None,
     reservoir_rows: int = 32,
@@ -721,9 +1029,16 @@ def collect_mbq_search_cached(
     if cached is not None:
         return cached, True
     raw_cache_hit = False
-    raw_path = cache_dir / f"mbq_stats_{raw_key}.pt" if raw_key else None
+    raw_root = raw_cache_dir or cache_dir
+    raw_path = raw_root / f"mbq_stats_{raw_key}.pt" if raw_key else None
     raw = (
-        load_mbq_raw_statistics(raw_path, key=raw_key, selected=selected)
+        load_mbq_raw_statistics(
+            raw_path,
+            key=raw_key,
+            selected=selected,
+            modality_mode=config.mbq_modality_mode,
+            algorithm_version=config.mbq_algorithm_version,
+        )
         if raw_path is not None and raw_key is not None else None
     )
     if raw is None:
@@ -733,6 +1048,8 @@ def collect_mbq_search_cached(
             reservoir_rows=reservoir_rows,
             seed=config.seed,
             attention_implementation=attention_implementation,
+            modality_mode=config.mbq_modality_mode,
+            algorithm_version=config.mbq_algorithm_version,
         )
         raw_seconds = time.perf_counter() - raw_started
         if raw_path is not None and raw_key is not None:
@@ -740,14 +1057,22 @@ def collect_mbq_search_cached(
     else:
         raw_cache_hit = True
         raw_seconds = 0.0
-    ratios = aggregate_gradient_ratios(
-        raw.gradient_records, config.mbq_gradient_aggregation,
-    )
+    modalities = enabled_modalities(config.mbq_modality_mode)
+    if config.mbq_modality_mode == "vision_answer":
+        weights = aggregate_gradient_ratios(
+            raw.gradient_records, config.mbq_gradient_aggregation,
+        )
+    else:
+        weights = aggregate_gradient_weights(
+            raw.gradient_records,
+            config.mbq_gradient_aggregation,
+            modalities=modalities,
+        )
     token_counts = dict(raw.token_counts)
     token_counts["gradient_aggregation"] = config.mbq_gradient_aggregation
     search_started = time.perf_counter()
     result = search_mbq_scales(
-        selected, raw.stats, ratios, config, token_counts,
+        selected, raw.stats, weights, config, token_counts,
     )
     result.audit["search_seconds"] = time.perf_counter() - search_started
     result.audit["raw_statistics_seconds"] = raw_seconds

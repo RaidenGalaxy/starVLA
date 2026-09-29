@@ -1,0 +1,9 @@
+# Install torch from the appropriate official CPU wheel index for the host.
+torch>=2.6,<2.7
+transformers>=4.57,<4.58
+huggingface-hub>=0.34
+accelerate>=1.0
+qwen-vl-utils>=0.0.14
+einops>=0.8,<0.9
+safetensors>=0.5
+Pillow>=10
