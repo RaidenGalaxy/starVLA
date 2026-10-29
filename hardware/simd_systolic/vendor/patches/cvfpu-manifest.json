@@ -1,0 +1,21 @@
+{
+  "cvfpu_commit": "77811635cb7e8649f1d9484733ee6a0bdb44a0e6",
+  "derivatives": [
+    {
+      "base": "vendor/fpnew_fma.sv",
+      "target": "rtl/SimdFpHF.sv",
+      "patch": "vendor/patches/cvfpu-fma-hf8.patch",
+      "base_sha256": "fa01fd6f8934056da2de855e3f53aa802006834d8ff1467899f8af67400e8845",
+      "target_sha256": "ff90d9918a7067e2f253bb7693d2ce7b7eb3cf80b9746d808a6327ff2a5d002a",
+      "patch_sha256": "1f3a1ecfa87b2e744febedb91e49940f76be1149862da4e9a7a2ab681a531736"
+    },
+    {
+      "base": "vendor/fpnew_fma.sv",
+      "target": "rtl/SimdFpHF12.sv",
+      "patch": "vendor/patches/cvfpu-fma-hf12.patch",
+      "base_sha256": "fa01fd6f8934056da2de855e3f53aa802006834d8ff1467899f8af67400e8845",
+      "target_sha256": "95bd4032eeabfa6b22eda8d98a7b27bdd3f57521f211c47fbbe3c570a42afde3",
+      "patch_sha256": "50b430988e6ae2278183c836bcd98feb0228cd2f39c32abf2652d950cc381cf3"
+    }
+  ]
+}

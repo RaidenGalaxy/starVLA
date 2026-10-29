@@ -237,6 +237,8 @@ wandb/*
 */**/*.md
 */*.md
 !examples/**/README.md
+!experiments/ffn_quant_compression/README.md
+!experiments/ffn_quant_generalization/README.md
 
 # Whitelist specific docs that should be tracked
 !.github/PULL_REQUEST_TEMPLATE.md

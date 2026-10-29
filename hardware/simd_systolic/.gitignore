@@ -1,0 +1,10 @@
+.build/
+.build_*.log
+.build_*.json
+.deps/
+target/
+project/target/
+artifacts/*
+!artifacts/.gitkeep
+__pycache__/
+.pytest_cache/

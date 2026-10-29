@@ -1,0 +1,201 @@
+{
+  "cvfpu": {
+    "commit": "77811635cb7e8649f1d9484733ee6a0bdb44a0e6",
+    "url": "https://github.com/openhwfoundation/cvfpu.git"
+  },
+  "common_cells": {
+    "commit": "6aeee85d0a34fedc06c14f04fd6363c9f7b4eeea",
+    "url": "https://github.com/pulp-platform/common_cells.git"
+  },
+  "dramsim3": {
+    "commit": "29817593b3389f1337235d63cac515024ab8fd6e",
+    "url": "https://github.com/umd-memsys/DRAMsim3.git"
+  },
+  "tool_versions": {
+    "sbt": "1.9.7",
+    "scala": "2.13.16",
+    "chisel": "7.0.0",
+    "firtool": "1.128.0",
+    "verilator": "5.046",
+    "yosys_frontend": "0.70+157",
+    "yosys_mapper": "0.33",
+    "openroad": "2.0-17598-ga008522d8",
+    "opensta": "2.6.0"
+  },
+  "downloads": {
+    "oss.tgz": {
+      "url": "https://github.com/YosysHQ/oss-cad-suite-build/releases/download/2026-10-19/oss-cad-suite-linux-x64-20261019.tgz",
+      "sha256": "ed9cbe56ed516bce72e97ccde489ab2be8d56a6a7f51068660e005b783b1c72f"
+    },
+    "openroad.deb": {
+      "url": "https://github.com/Precision-Innovations/OpenROAD/releases/download/2024-12-14/openroad_2.0-17598-ga008522d8_amd64-ubuntu-22.04.deb",
+      "sha256": "40ed178396b0276a5d5dfbbe695c9de9aac9088157a6655be02b39a0cef07207"
+    },
+    "libpython310.deb": {
+      "url": "https://security.ubuntu.com/ubuntu/pool/main/p/python3.10/libpython3.10_3.10.12-1~22.04.18_amd64.deb",
+      "sha256": "cd9ffe066be6207dd4fcb25fe037222e90429b0923d1a5eb6e897afcbb151833"
+    }
+  },
+  "nangate45": {
+    "commit": "19dc41d9e83b8e6903d8408eb99c563a9470a1ad",
+    "base_url": "https://raw.githubusercontent.com/The-OpenROAD-Project/OpenROAD-flow-scripts/19dc41d9e83b8e6903d8408eb99c563a9470a1ad/flow/platforms/nangate45/",
+    "files": {
+      "NangateOpenCellLibrary_typical.lib": {
+        "path": "lib/NangateOpenCellLibrary_typical.lib",
+        "sha256": "8d540a4d4cf6d09d27c87ad067857a9c0c2eeb023ab7a56e058cd3113db4e9b1"
+      },
+      "NangateOpenCellLibrary.tech.lef": {
+        "path": "lef/NangateOpenCellLibrary.tech.lef",
+        "sha256": "834a79295054cd4209178d1bade67c353863c47bb4b3c22ee38b862b7cec37f2"
+      },
+      "NangateOpenCellLibrary.macro.mod.lef": {
+        "path": "lef/NangateOpenCellLibrary.macro.mod.lef",
+        "sha256": "a43aea339f12a57a63497783e508ba16f3da2dc056d3247dec7d99707c2dedef"
+      },
+      "make_tracks.tcl": {
+        "path": "make_tracks.tcl",
+        "sha256": "8f8fbff8d8e0dfd232307058f6766973742e36f8f27bd1c717ea001e142cba99"
+      },
+      "rcx_patterns.rules": {
+        "path": "rcx_patterns.rules",
+        "sha256": "2f65fafbe2c704b378563c53a680b93cef080c2799997019d43df7d1e5a563e9"
+      }
+    }
+  },
+  "asap7": {
+    "commit": "19dc41d9e83b8e6903d8408eb99c563a9470a1ad",
+    "base_url": "https://raw.githubusercontent.com/The-OpenROAD-Project/OpenROAD-flow-scripts/19dc41d9e83b8e6903d8408eb99c563a9470a1ad/flow/platforms/asap7/",
+    "files": {
+      "config.mk": {
+        "path": "config.mk",
+        "sha256": "86a4a24e4473d584633c6738c70876999c4ab74aa25256706629bef1bfab5471"
+      },
+      "setRC.tcl": {
+        "path": "setRC.tcl",
+        "sha256": "ce6e29fe23b648839009c53035901066653d5850f9419ba85169c715b2cebd14"
+      },
+      "lef/asap7_tech_1x_201209.lef": {
+        "path": "lef/asap7_tech_1x_201209.lef",
+        "sha256": "7694bf4f8ef2f9745e4579f454788a0cf048e8605320f32d1d83ec540ed4ca41"
+      },
+      "lef/asap7sc7p5t_28_R_1x_220121a.lef": {
+        "path": "lef/asap7sc7p5t_28_R_1x_220121a.lef",
+        "sha256": "4eb73f825720d95eba4da455c7b2e7a28e444e88e9d8595d13492cf5eecfc0d1"
+      },
+      "gds/asap7sc7p5t_28_R_220121a.gds": {
+        "path": "gds/asap7sc7p5t_28_R_220121a.gds",
+        "sha256": "f43d5b33df635cf9e66cbca66b6bdd05364f824d8040cd21528b9e12808b9263"
+      },
+      "rcx_patterns.rules": {
+        "path": "rcx_patterns.rules",
+        "sha256": "32a117e5e866d3de1406e8f18d65b6f1857781f156638941a4769e25ef5252cc"
+      },
+      "openRoad/make_tracks.tcl": {
+        "path": "openRoad/make_tracks.tcl",
+        "sha256": "4693c8fc81cf9095ed7fba61e778ec81c16c3cadc747f9ce388acf38f8331632"
+      },
+      "openRoad/tapcell.tcl": {
+        "path": "openRoad/tapcell.tcl",
+        "sha256": "582c43c5d1ceee9ede9b71afc15fb4d98cf98a4a335d3c06b0123033520ddf2e"
+      },
+      "openRoad/pdn/grid_strategy-M1-M2-M5-M6.tcl": {
+        "path": "openRoad/pdn/grid_strategy-M1-M2-M5-M6.tcl",
+        "sha256": "7eb4c880be9357ed33c352ff84c2870b9c02312db96cdf7b0a5214fb39d0a844"
+      },
+      "lib/NLDM/asap7sc7p5t_AO_RVT_TT_nldm_211120.lib.gz": {
+        "path": "lib/NLDM/asap7sc7p5t_AO_RVT_TT_nldm_211120.lib.gz",
+        "sha256": "fe9f1c18e88ab129d63ad82adc256f3a85c7e38e47dabbe0a96749b41087dea1"
+      },
+      "lib/NLDM/asap7sc7p5t_INVBUF_RVT_TT_nldm_220122.lib.gz": {
+        "path": "lib/NLDM/asap7sc7p5t_INVBUF_RVT_TT_nldm_220122.lib.gz",
+        "sha256": "8d6db2c2f83c3c162be54a5e102b2d379fcaaaef2db5f0b1d4152c395d01fea1"
+      },
+      "lib/NLDM/asap7sc7p5t_OA_RVT_TT_nldm_211120.lib.gz": {
+        "path": "lib/NLDM/asap7sc7p5t_OA_RVT_TT_nldm_211120.lib.gz",
+        "sha256": "bbe6d904d58c7367de1ed7639e4eae386c65fa0a5af26ae62dc5e4e2ec52b08b"
+      },
+      "lib/NLDM/asap7sc7p5t_SIMPLE_RVT_TT_nldm_211120.lib.gz": {
+        "path": "lib/NLDM/asap7sc7p5t_SIMPLE_RVT_TT_nldm_211120.lib.gz",
+        "sha256": "073ac4b6b08f272b6953b0ad54d1d9743767a7d15a0e2964ed86cf44c3dbe00e"
+      },
+      "lib/NLDM/asap7sc7p5t_SEQ_RVT_TT_nldm_220123.lib": {
+        "path": "lib/NLDM/asap7sc7p5t_SEQ_RVT_TT_nldm_220123.lib",
+        "sha256": "57a0b403485b99ebd676942af4673ac086b86c7c75fbdc3e5c0038501dd22ba3"
+      },
+      "lib/NLDM/asap7sc7p5t_AO_RVT_SS_nldm_211120.lib.gz": {
+        "path": "lib/NLDM/asap7sc7p5t_AO_RVT_SS_nldm_211120.lib.gz",
+        "sha256": "9ac9c70139da3c4c72b2ed6113f011d8d96de2b30f9b261a237d2ed58ffa1ff5"
+      },
+      "lib/NLDM/asap7sc7p5t_INVBUF_RVT_SS_nldm_220122.lib.gz": {
+        "path": "lib/NLDM/asap7sc7p5t_INVBUF_RVT_SS_nldm_220122.lib.gz",
+        "sha256": "339371d339fc0e3f4f50fa493ce82b984743af46d26823263dcca7a391e64408"
+      },
+      "lib/NLDM/asap7sc7p5t_OA_RVT_SS_nldm_211120.lib.gz": {
+        "path": "lib/NLDM/asap7sc7p5t_OA_RVT_SS_nldm_211120.lib.gz",
+        "sha256": "6912520ffc1ae5bf69103d0286bcb7867fc90de80365dfc8ec0d6b55a9113f27"
+      },
+      "lib/NLDM/asap7sc7p5t_SIMPLE_RVT_SS_nldm_211120.lib.gz": {
+        "path": "lib/NLDM/asap7sc7p5t_SIMPLE_RVT_SS_nldm_211120.lib.gz",
+        "sha256": "71e55ce94cde9d10ad726cf7131e7356501aa1c380ae4e138f47c2f8ca7ca7db"
+      },
+      "lib/NLDM/asap7sc7p5t_SEQ_RVT_SS_nldm_220123.lib": {
+        "path": "lib/NLDM/asap7sc7p5t_SEQ_RVT_SS_nldm_220123.lib",
+        "sha256": "c6a6d9ad22bfb1bc9cf1c4ac66d09ce575ca18648ce4e50597d92174bc290d78"
+      },
+      "lib/NLDM/asap7sc7p5t_AO_RVT_FF_nldm_211120.lib.gz": {
+        "path": "lib/NLDM/asap7sc7p5t_AO_RVT_FF_nldm_211120.lib.gz",
+        "sha256": "9e3848d247f9bbc8d405ee55617af98797b6d5be9a1af02988ec5d59ca9dad99"
+      },
+      "lib/NLDM/asap7sc7p5t_INVBUF_RVT_FF_nldm_220122.lib.gz": {
+        "path": "lib/NLDM/asap7sc7p5t_INVBUF_RVT_FF_nldm_220122.lib.gz",
+        "sha256": "e0c65688e6067ee485b0693651298636ae9ef5a0512154bcd4b7c4914d1a0ac6"
+      },
+      "lib/NLDM/asap7sc7p5t_OA_RVT_FF_nldm_211120.lib.gz": {
+        "path": "lib/NLDM/asap7sc7p5t_OA_RVT_FF_nldm_211120.lib.gz",
+        "sha256": "cc9651e9235bcd29bba0737b7ba7a8afddde7462df3ff48d3870c22d05c86fb3"
+      },
+      "lib/NLDM/asap7sc7p5t_SIMPLE_RVT_FF_nldm_250407.lib.gz": {
+        "path": "lib/NLDM/asap7sc7p5t_SIMPLE_RVT_FF_nldm_250407.lib.gz",
+        "sha256": "0c93d44fcc6a30182d71031997771ea3fc0d09235201e9252f71daf48a1c7a38"
+      },
+      "lib/NLDM/asap7sc7p5t_SEQ_RVT_FF_nldm_220123.lib": {
+        "path": "lib/NLDM/asap7sc7p5t_SEQ_RVT_FF_nldm_220123.lib",
+        "sha256": "d9b6e75c8720cdd450cff15178528502cc8df34c5ab6b0ffb53fc99d664b5302"
+      }
+    }
+  },
+  "asap7_sram": {
+    "commit": "522eeccbccefcd66e61893fa1059df24d95e9f86",
+    "base_url": "https://raw.githubusercontent.com/The-OpenROAD-Project/asap7_sram_0p0/522eeccbccefcd66e61893fa1059df24d95e9f86/",
+    "files": {
+      "README.md": {
+        "path": "README.md",
+        "sha256": "f726361ccb8956d984d298e0eab225814f0f76bdf6d51ef6ebd37802ef404435"
+      },
+      "LICENSE": {
+        "path": "LICENSE",
+        "sha256": "f729eadf714ca54a7b665f9094f9687ba7b7f2c30e6c294431d1f0e2b1144245"
+      },
+      "verilog/README.txt": {
+        "path": "verilog/README.txt",
+        "sha256": "529dd44601434a5c2e46a57c18b6ece7206d2075763449e738e3e1bc5c84a595"
+      },
+      "gds/srambank_64b.gds": {
+        "path": "gds/srambank_64b.gds",
+        "sha256": "ce46131dc16844ab94ba69ad04e9eac896105d9ef46d2f427c1bde97dc581f94"
+      },
+      "generated/LEF/srambank_256x4x64_6t122.lef": {
+        "path": "generated/LEF/srambank_256x4x64_6t122.lef",
+        "sha256": "700dbddb2175fab15f76f8f96d8ebbdf99b9dc37aeb39ec8b16ba13852740d24"
+      },
+      "generated/LIB/srambank_256x4x64_6t122.lib": {
+        "path": "generated/LIB/srambank_256x4x64_6t122.lib",
+        "sha256": "878fad5a5ba7998da1ffb6fc3c20b5e5848fe8a5d0a1e23b573927440279461d"
+      },
+      "generated/verilog/srambank_256x4x64_6t122.v": {
+        "path": "generated/verilog/srambank_256x4x64_6t122.v",
+        "sha256": "3ad2e912ac733699fd46b3f207a80138ed45d02152464dbd5d029bf0f1983766"
+      }
+    }
+  }
+}

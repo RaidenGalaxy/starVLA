@@ -1,0 +1,111 @@
+{
+  "kind": "open_source_sram_transistor_diagnostics",
+  "ngspice": {
+    "version": "42+ds-3build1",
+    "url": "https://archive.ubuntu.com/ubuntu/pool/universe/n/ngspice/ngspice_42+ds-3build1_amd64.deb",
+    "archive": "ngspice_42+ds-3build1_amd64.deb",
+    "sha256": "466c4c06418107ceaa9c9457065b3bb71a9d9dc5ec6fef186d7de9d5208ce8db",
+    "executable": "ngspice/usr/bin/ngspice",
+    "executable_sha256": "820658317b0b54035208da41936fd6871ce924036e5ea4113a4168b821b7fc45"
+  },
+  "openvaf": {
+    "version": "23.5.0",
+    "url": "https://openva.fra1.cdn.digitaloceanspaces.com/openvaf_23_5_0_linux_amd64.tar.gz",
+    "archive": "openvaf_23_5_0_linux_amd64.tar.gz",
+    "sha256": "79c0e08ad948a7a9f460dc87be88b261bbd99b63a4038db3c64680189f44e4f0",
+    "executable": "openvaf/openvaf",
+    "executable_sha256": "6918195bc6cca54016095923bea190f7a1d96dd8b062104c602e8c28578cb5e3"
+  },
+  "bsim_cmg_107": {
+    "repository": "Xyce/Xyce",
+    "commit": "e5b7b9bb5b221630c66654c059fc2d33524f5b21",
+    "files": [
+      {
+        "name": "Makefile",
+        "sha": "7c39426366c6f7bf9829596b72b49c4321b7aaae",
+        "url": "https://raw.githubusercontent.com/Xyce/Xyce/e5b7b9bb5b221630c66654c059fc2d33524f5b21/utils/ADMS/examples/bsimcmg_107.0.0/code/Makefile",
+        "sha256": "35e732f8581980f0b033af9d538d17fe71c00a2623aee6b29175541a9932bed5"
+      },
+      {
+        "name": "bsimcmg.va",
+        "sha": "498e4d7724f2850da3f45659053a2390f5b027ac",
+        "url": "https://raw.githubusercontent.com/Xyce/Xyce/e5b7b9bb5b221630c66654c059fc2d33524f5b21/utils/ADMS/examples/bsimcmg_107.0.0/code/bsimcmg.va",
+        "sha256": "85e0e6bc432486fc276cafad8b0b2797fc5b8252582713c3c911bdc118fdf519"
+      },
+      {
+        "name": "bsimcmg_binning_parameters.include",
+        "sha": "ee345f3f262f3953850afa48540f51be07be56e7",
+        "url": "https://raw.githubusercontent.com/Xyce/Xyce/e5b7b9bb5b221630c66654c059fc2d33524f5b21/utils/ADMS/examples/bsimcmg_107.0.0/code/bsimcmg_binning_parameters.include",
+        "sha256": "f38270b9871735436a23e2f35c895475a123fed3447d282193f7de7c7037f502"
+      },
+      {
+        "name": "bsimcmg_body.include",
+        "sha": "f4fab12922560fbee057ab6d8d020d389b58bc04",
+        "url": "https://raw.githubusercontent.com/Xyce/Xyce/e5b7b9bb5b221630c66654c059fc2d33524f5b21/utils/ADMS/examples/bsimcmg_107.0.0/code/bsimcmg_body.include",
+        "sha256": "69e259439419d1a61eb72994c5b932249f891c619f258ab3b3cd941b5b781dee"
+      },
+      {
+        "name": "bsimcmg_cfringe.include",
+        "sha": "ecc7fbac8df8e3c1a5bd1c05c806ea87e3f9cb1f",
+        "url": "https://raw.githubusercontent.com/Xyce/Xyce/e5b7b9bb5b221630c66654c059fc2d33524f5b21/utils/ADMS/examples/bsimcmg_107.0.0/code/bsimcmg_cfringe.include",
+        "sha256": "0d53a65affa781cf36e4d7c256efa76414fbfd03033333be7576fc6aff74b717"
+      },
+      {
+        "name": "bsimcmg_compute_nqsmod3_segment.include",
+        "sha": "5c82b958023bde48d4d167d4f8fa0fd66f971795",
+        "url": "https://raw.githubusercontent.com/Xyce/Xyce/e5b7b9bb5b221630c66654c059fc2d33524f5b21/utils/ADMS/examples/bsimcmg_107.0.0/code/bsimcmg_compute_nqsmod3_segment.include",
+        "sha256": "29b63e4123af1261efa846428270cc13c0902ce394b799eea0defcb43a065700"
+      },
+      {
+        "name": "bsimcmg_load_nqsmod3_segments.include",
+        "sha": "5c51e2bc900cb0c1e55b1ab263779f7d17f9d388",
+        "url": "https://raw.githubusercontent.com/Xyce/Xyce/e5b7b9bb5b221630c66654c059fc2d33524f5b21/utils/ADMS/examples/bsimcmg_107.0.0/code/bsimcmg_load_nqsmod3_segments.include",
+        "sha256": "4d579bece66018886991744e899b3d911397ca3ce75c1a33348a228e86bb2d3e"
+      },
+      {
+        "name": "bsimcmg_main.va",
+        "sha": "a6a3cacb377dfd72ceb1653605c3c2e9b38d15df",
+        "url": "https://raw.githubusercontent.com/Xyce/Xyce/e5b7b9bb5b221630c66654c059fc2d33524f5b21/utils/ADMS/examples/bsimcmg_107.0.0/code/bsimcmg_main.va",
+        "sha256": "b92e064d9cba8a3916ddd61de36311557fce62133a988e1a5dbe25df4bdc6454"
+      },
+      {
+        "name": "bsimcmg_nqsmod3.va",
+        "sha": "9eec1a475244b703998734a97377665531c8355f",
+        "url": "https://raw.githubusercontent.com/Xyce/Xyce/e5b7b9bb5b221630c66654c059fc2d33524f5b21/utils/ADMS/examples/bsimcmg_107.0.0/code/bsimcmg_nqsmod3.va",
+        "sha256": "9c659e7bdb3b6599841df9b9f842dca1358a4c0aa484305085b551af480577b1"
+      },
+      {
+        "name": "bsimcmg_nqsmod3_iv_cv.include",
+        "sha": "ccd8d95f967d872df156a89fabc433e3d60ece5b",
+        "url": "https://raw.githubusercontent.com/Xyce/Xyce/e5b7b9bb5b221630c66654c059fc2d33524f5b21/utils/ADMS/examples/bsimcmg_107.0.0/code/bsimcmg_nqsmod3_iv_cv.include",
+        "sha256": "9a64465c5e80404bb7aca54ff3d85bfa3d5a573303ba758317ad217f29cd7293"
+      },
+      {
+        "name": "bsimcmg_quasi_static_cv.include",
+        "sha": "fb347945db4ca4f3f196bbce8737ba15bd22bc85",
+        "url": "https://raw.githubusercontent.com/Xyce/Xyce/e5b7b9bb5b221630c66654c059fc2d33524f5b21/utils/ADMS/examples/bsimcmg_107.0.0/code/bsimcmg_quasi_static_cv.include",
+        "sha256": "000639b0a46c8c1d4e53d6d6aa53fb3e201357cadf647a7df3464559ee9ea89c"
+      },
+      {
+        "name": "bsimcmg_rdsmod.include",
+        "sha": "2b71c943c43c47cef2b159661e095eaf7d0490c6",
+        "url": "https://raw.githubusercontent.com/Xyce/Xyce/e5b7b9bb5b221630c66654c059fc2d33524f5b21/utils/ADMS/examples/bsimcmg_107.0.0/code/bsimcmg_rdsmod.include",
+        "sha256": "f657a19fea0da38be51adaeb2bdd16ca9807d44a06460d7935a58301b63f720f"
+      },
+      {
+        "name": "common_defs.include",
+        "sha": "8a915a6411b302be94af92bfbe6d71ea27682293",
+        "url": "https://raw.githubusercontent.com/Xyce/Xyce/e5b7b9bb5b221630c66654c059fc2d33524f5b21/utils/ADMS/examples/bsimcmg_107.0.0/code/common_defs.include",
+        "sha256": "dfe1b8923b01e0040d85c9deaf66c82de9df9f47e93d8526df50f206da9fab69"
+      },
+      {
+        "name": "insert_devconmap.patch",
+        "sha": "086f5d73ddec3b008f4296a40528bf282b4219ff",
+        "url": "https://raw.githubusercontent.com/Xyce/Xyce/e5b7b9bb5b221630c66654c059fc2d33524f5b21/utils/ADMS/examples/bsimcmg_107.0.0/code/insert_devconmap.patch",
+        "sha256": "216ca0e95b2c935093a3f0c9318b6bb847eb08e716fd6869085df6ca41627833"
+      }
+    ]
+  },
+  "upstream_model_credit": "BSIM-CMG107, Regents of the University of California, Berkeley, as preserved in every upstream source header.",
+  "scope": "Schematic transistor diagnostics only. No foundry DRC/LVS/PEX deck or macro characterization certification."
+}

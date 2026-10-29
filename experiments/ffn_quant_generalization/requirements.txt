@@ -1,0 +1,9 @@
+# Reuse the CPU environment frozen by outputs/ffn_quant_compression_v1/audit/audit.json.
+torch==2.6.0+cpu
+transformers==4.57.0
+numpy==1.26.4
+Pillow==12.3.0
+huggingface-hub==0.36.2
+pyarrow==25.0.1
+scipy==1.14.1
+matplotlib==3.11.2

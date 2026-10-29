@@ -1,0 +1,165 @@
+--- a/src/controller.h
++++ b/src/controller.h
+@@ -27,6 +27,12 @@
+ #else
+     Controller(int channel, const Config &config, const Timing &timing);
+ #endif  // THERMAL
++
++    // SIMD evaluation extension: posted write acknowledgements are unchanged.
++    void RequestDrain();
++    bool IsDrained() const;
++    uint64_t GetReadBursts() const;
++    uint64_t GetWriteBursts() const;
+     void ClockTick();
+     bool WillAcceptTransaction(uint64_t hex_addr, bool is_write) const;
+     bool AddTransaction(Transaction trans);
+@@ -40,6 +46,8 @@
+     int channel_id_;
+ 
+    private:
++    bool force_drain_ = false;
++    uint64_t last_data_end_ = 0, physical_reads_ = 0, physical_writes_ = 0;
+     uint64_t clk_;
+     const Config &config_;
+     SimpleStats simple_stats_;
+--- a/src/controller.cc
++++ b/src/controller.cc
+@@ -2,6 +2,7 @@
+ #include <iomanip>
+ #include <iostream>
+ #include <limits>
++#include <algorithm>
+ 
+ namespace dramsim3 {
+ 
+@@ -159,6 +160,7 @@
+ }
+ 
+ bool Controller::AddTransaction(Transaction trans) {
++    force_drain_ = false;
+     trans.added_cycle = clk_;
+     simple_stats_.AddValue("interarrival_latency", clk_ - last_trans_clk_);
+     last_trans_clk_ = clk_;
+@@ -199,7 +201,8 @@
+     if (write_draining_ == 0 && !is_unified_queue_) {
+         // we basically have a upper and lower threshold for write buffer
+         if ((write_buffer_.size() >= write_buffer_.capacity()) ||
+-            (write_buffer_.size() > 8 && cmd_queue_.QueueEmpty())) {
++            (write_buffer_.size() > 8 && cmd_queue_.QueueEmpty()) ||
++            (force_drain_ && !write_buffer_.empty())) {
+             write_draining_ = write_buffer_.size();
+         }
+     }
+@@ -236,6 +239,8 @@
+ #endif  // THERMAL
+     // if read/write, update pending queue and return queue
+     if (cmd.IsRead()) {
++        ++physical_reads_;
++        last_data_end_ = std::max(last_data_end_, clk_ + uint64_t(config_.read_delay));
+         auto num_reads = pending_rd_q_.count(cmd.hex_addr);
+         if (num_reads == 0) {
+             std::cerr << cmd.hex_addr << " not in read queue! " << std::endl;
+@@ -250,6 +255,8 @@
+             num_reads -= 1;
+         }
+     } else if (cmd.IsWrite()) {
++        ++physical_writes_;
++        last_data_end_ = std::max(last_data_end_, clk_ + uint64_t(config_.write_delay));
+         // there should be only 1 write to the same location at a time
+         auto it = pending_wr_q_.find(cmd.hex_addr);
+         if (it == pending_wr_q_.end()) {
+@@ -344,4 +351,14 @@
+     }
+ }
+ 
++
++void Controller::RequestDrain() { force_drain_ = true; }
++bool Controller::IsDrained() const {
++    return read_queue_.empty() && write_buffer_.empty() && unified_queue_.empty()
++        && pending_rd_q_.empty() && pending_wr_q_.empty() && return_queue_.empty()
++        && cmd_queue_.QueueEmpty() && clk_ >= last_data_end_;
++}
++uint64_t Controller::GetReadBursts() const { return physical_reads_; }
++uint64_t Controller::GetWriteBursts() const { return physical_writes_; }
++
+ }  // namespace dramsim3
+--- a/src/dram_system.h
++++ b/src/dram_system.h
+@@ -27,6 +27,12 @@
+     void PrintEpochStats();
+     void PrintStats();
+     void ResetStats();
++    // SIMD evaluation extension: posted write acknowledgements are unchanged.
++    void RequestDrain();
++    bool IsDrained() const;
++    uint64_t GetReadBursts() const;
++    uint64_t GetWriteBursts() const;
++
+ 
+     virtual bool WillAcceptTransaction(uint64_t hex_addr,
+                                        bool is_write) const = 0;
+--- a/src/dram_system.cc
++++ b/src/dram_system.cc
+@@ -204,4 +204,17 @@
+     return;
+ }
+ 
++
++void BaseDRAMSystem::RequestDrain() { for (auto c : ctrls_) c->RequestDrain(); }
++bool BaseDRAMSystem::IsDrained() const {
++    for (auto c : ctrls_) if (!c->IsDrained()) return false;
++    return true;
++}
++uint64_t BaseDRAMSystem::GetReadBursts() const {
++    uint64_t n=0; for (auto c : ctrls_) n+=c->GetReadBursts(); return n;
++}
++uint64_t BaseDRAMSystem::GetWriteBursts() const {
++    uint64_t n=0; for (auto c : ctrls_) n+=c->GetWriteBursts(); return n;
++}
++
+ }  // namespace dramsim3
+--- a/src/memory_system.h
++++ b/src/memory_system.h
+@@ -26,6 +26,12 @@
+     int GetQueueSize() const;
+     void PrintStats() const;
+     void ResetStats();
++    // SIMD evaluation extension: posted write acknowledgements are unchanged.
++    void RequestDrain();
++    bool IsDrained() const;
++    uint64_t GetReadBursts() const;
++    uint64_t GetWriteBursts() const;
++
+ 
+     bool WillAcceptTransaction(uint64_t hex_addr, bool is_write) const;
+     bool AddTransaction(uint64_t hex_addr, bool is_write);
+--- a/src/memory_system.cc
++++ b/src/memory_system.cc
+@@ -55,6 +55,12 @@
+                  std::function<void(uint64_t)> write_callback) {
+     return new MemorySystem(config_file, output_dir, read_callback, write_callback);
+ }
++
++void MemorySystem::RequestDrain() { dram_system_->RequestDrain(); }
++bool MemorySystem::IsDrained() const { return dram_system_->IsDrained(); }
++uint64_t MemorySystem::GetReadBursts() const { return dram_system_->GetReadBursts(); }
++uint64_t MemorySystem::GetWriteBursts() const { return dram_system_->GetWriteBursts(); }
++
+ }  // namespace dramsim3
+ 
+ // This function can be used by autoconf AC_CHECK_LIB since
+--- a/src/dramsim3.h
++++ b/src/dramsim3.h
+@@ -22,6 +22,12 @@
+     int GetQueueSize() const;
+     void PrintStats() const;
+     void ResetStats();
++    // SIMD evaluation extension: posted write acknowledgements are unchanged.
++    void RequestDrain();
++    bool IsDrained() const;
++    uint64_t GetReadBursts() const;
++    uint64_t GetWriteBursts() const;
++
+ 
+     bool WillAcceptTransaction(uint64_t hex_addr, bool is_write) const;
+     bool AddTransaction(uint64_t hex_addr, bool is_write);

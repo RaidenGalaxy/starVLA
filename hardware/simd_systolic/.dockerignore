@@ -1,0 +1,8 @@
+.build
+.deps
+target
+project/target
+artifacts
+results
+.git
+__pycache__

@@ -1,0 +1,169 @@
+diff --git a/include/main_config_helpers.hpp b/include/main_config_helpers.hpp
+index 3bfde70..49e53e7 100644
+--- a/include/main_config_helpers.hpp
++++ b/include/main_config_helpers.hpp
+@@ -18,6 +18,7 @@ struct MainCliOptions {
+     // Open-source flow options (Yosys / OpenROAD / OpenSTA)
+     bool use_yosys = false;       // use Yosys instead of Design Compiler
+     bool use_openroad = false;    // use OpenROAD instead of Innovus
++    bool emit_unverified_layout = false; // explicit research export; never a timing pass
+     bool openroad_only = false;   // alias: enable both use_yosys + use_openroad for single-port ASAP7
+     std::string openroad_path = ""; // OpenROAD binary; default resolves 'openroad' from $PATH
+     std::string platform_path = ""; // path to ASAP7 platform (default: <openroad>/platform/asap7)
+diff --git a/src/main_config_helpers.cpp b/src/main_config_helpers.cpp
+index 012b24f..d617a8f 100644
+--- a/src/main_config_helpers.cpp
++++ b/src/main_config_helpers.cpp
+@@ -69,6 +69,11 @@ MainCliOptions parseMainCliOptions(int argc, char** argv) {
+         .default_value(false)
+         .implicit_value(true);
+ 
++    program.add_argument("--emit-unverified-layout")
++        .help("Export routed diagnostic GDS after failed periphery STA; not frequency certification.")
++        .default_value(false)
++        .implicit_value(true);
++
+     program.add_argument("--openroad-path")
+         .help("OpenROAD binary name or path (default: 'openroad' resolved from $PATH)")
+         .default_value(std::string(""))
+@@ -120,6 +125,7 @@ MainCliOptions parseMainCliOptions(int argc, char** argv) {
+     options.use_yosys             = program.get<bool>("--use-yosys");
+     options.use_openroad          = program.get<bool>("--use-openroad");
+     options.openroad_only         = program.get<bool>("--openroad");
++    options.emit_unverified_layout = program.get<bool>("--emit-unverified-layout");
+     options.openroad_path         = program.get<std::string>("--openroad-path");
+     options.platform_path         = program.get<std::string>("--platform-path");
+     options.liberty_from_json     = program.get<std::string>("--liberty-from");
+diff --git a/src/openroad_manager.cpp b/src/openroad_manager.cpp
+index 77c50d7..47b46bc 100644
+--- a/src/openroad_manager.cpp
++++ b/src/openroad_manager.cpp
+@@ -106,7 +106,8 @@ bool OpenRoadManager::run_openroad_flow() {
+     if (!or_ok) {
+         LOGE << "OpenROAD periphery flow failed (see " << log_file
+              << "); refusing to use partial DEF/netlist artifacts";
+-        return false;
++        if (!cli_options_.emit_unverified_layout) return false;
++        LOGW << "RESEARCH_EXPORT_ONLY: periphery STA failed; exporting unverified geometry and preserving failure reports.";
+     }
+ 
+     if (!file_exists(def_path) || !file_exists(v_path)) {
+diff --git a/src/openroad_tcl_generator.cpp b/src/openroad_tcl_generator.cpp
+index f2f4918..10769cf 100644
+--- a/src/openroad_tcl_generator.cpp
++++ b/src/openroad_tcl_generator.cpp
+@@ -205,9 +205,9 @@ bool OpenRoadTclGenerator::generate_run_tcl(double width, double height,
+ 
+     // Fail before placement if the SDC does not define real paths.  A zero
+     // WNS/TNS result with no constrained endpoints is not a timing pass.
+-    file << "set pre_paths [find_timing_paths -path_delay max -group_path_count 20]\n";
++    file << "set pre_paths [find_timing_paths -path_delay max -group_count 20]\n";
+     file << "if {[llength $pre_paths] == 0} { error \"PERIPHERY_STA: no constrained timing paths after read_sdc\" }\n";
+-    file << "set sdel_paths [find_timing_paths -from [get_ports -quiet {sdel*}] -path_delay max -group_path_count 4]\n";
++    file << "set sdel_paths [find_timing_paths -from [get_ports -quiet {sdel*}] -path_delay max -group_count 4]\n";
+     file << "if {[llength $sdel_paths] < 4} { error \"PERIPHERY_STA: not all sdel inputs reach sequential timing endpoints\" }\n";
+     file << "check_setup -verbose > pre_place_setup.rpt\n\n";
+ 
+@@ -261,7 +261,7 @@ bool OpenRoadTclGenerator::generate_run_tcl(double width, double height,
+     file << "estimate_parasitics -placement\n";
+     file << "repair_timing -setup -max_utilization 90 -max_buffer_percent 20\n";
+     file << "repair_timing -hold -max_utilization 90 -max_buffer_percent 20\n";
+-    file << "detailed_placement -incremental\n";
++    file << "detailed_placement\n";
+     file << "check_placement -verbose -report_file_name placement_post_cts.rpt\n\n";
+ 
+     // Fill before routing so filler geometry participates in detailed-route
+@@ -274,7 +274,7 @@ bool OpenRoadTclGenerator::generate_run_tcl(double width, double height,
+     // ASAP7 RC model.  This flow has no extraction SPEF yet, so reports say so
+     // explicitly rather than claiming transistor-level signoff.
+     file << "estimate_parasitics -global_routing\n";
+-    file << "set final_paths [find_timing_paths -path_delay max -group_path_count 100]\n";
++    file << "set final_paths [find_timing_paths -path_delay max -group_count 100]\n";
+     file << "if {[llength $final_paths] == 0} { error \"PERIPHERY_STA: no constrained post-route timing paths\" }\n";
+     file << "set final_delay_cells [get_cells -hierarchical -quiet {physical_delay_*}]\n";
+     file << "if {[llength $final_delay_cells] != 108} { error \"PERIPHERY_STRUCTURE: delay topology changed during implementation\" }\n";
+@@ -294,17 +294,24 @@ bool OpenRoadTclGenerator::generate_run_tcl(double width, double height,
+     file << "report_clock_properties > clock_properties.rpt\n";
+     file << "report_clock_skew -setup > clock_skew.rpt\n";
+     file << "report_design_area > design_area.rpt\n";
+-    file << "report_tns -max\n";
+-    file << "report_wns -max\n";
++    file << "report_tns\n";
++    file << "report_wns\n";
+     file << "if {[file size electrical.rpt] == 0} { set electrical_empty_fd [open electrical.rpt w]; puts $electrical_empty_fd \"PASS: no max slew, capacitance, or fanout violations.\"; close $electrical_empty_fd }\n";
++    // Save complete routed geometry before strict STA checks. The default
++    // manager still refuses failed results; explicit research export preserves
++    // the same failing 2ns evidence alongside the emitted physical views.
++    file << "write_def ctrl_decode.def\n";
++    file << "write_verilog netlist_for_lvs.v\n";
++    file << "write_sdc ctrl_decode.sdc\n";
++    file << "write_db ctrl_decode.odb\n";
+     file << "set electrical_fd [open electrical.rpt r]\n";
+     file << "set electrical_text [read $electrical_fd]\n";
+     file << "close $electrical_fd\n";
+     file << "if {[string first \"(VIOLATED)\" $electrical_text] >= 0} { error \"PERIPHERY_STA: max slew/capacitance/fanout violations remain\" }\n";
+-    file << "set setup_slack [worst_slack -max]\n";
+-    file << "set hold_slack [worst_slack -min]\n";
+-    file << "if {$setup_slack < -0.001} { error \"PERIPHERY_STA: setup timing violation $setup_slack ns\" }\n";
+-    file << "if {$hold_slack < -0.001} { error \"PERIPHERY_STA: hold timing violation $hold_slack ns\" }\n";
++    file << "set setup_slack [sta::format_time [sta::worst_slack_cmd max] 9]\n";
++    file << "set hold_slack [sta::format_time [sta::worst_slack_cmd min] 9]\n";
++    file << "if {$setup_slack < 0.0} { error \"PERIPHERY_STA: setup timing violation $setup_slack ns\" }\n";
++    file << "if {$hold_slack < 0.0} { error \"PERIPHERY_STA: hold timing violation $hold_slack ns\" }\n";
+     file << "puts \"PERIPHERY_STA_PASS paths=[llength $final_paths] setup_slack=$setup_slack hold_slack=$hold_slack\"\n\n";
+ 
+     // Physical pin creation for stacked_colgrp alignment (M3)
+@@ -463,16 +470,25 @@ bool OpenRoadTclGenerator::run_v2lvs(const std::string& work_dir,
+         LOGE << "SPICE conversion requires an existing work directory and CDL library";
+         return false;
+     }
+-    if (std::system("which v2lvs > /dev/null 2>&1") != 0) {
+-        LOGE << "v2lvs not found in PATH; refusing to generate a placeholder SPICE netlist";
++    const char* alternative = std::getenv("OPENFINRAM_SPICE_CONVERTER");
++    const bool open_converter = alternative && file_exists(alternative);
++    if (!open_converter && std::system("which v2lvs > /dev/null 2>&1") != 0) {
++        LOGE << "No mapped-gate-to-CDL converter available; refusing placeholder SPICE";
+         return false;
+     }
+     std::ostringstream cmd;
+-    cmd << "cd " << shell_quote(work_dir)
+-        << " && v2lvs -v " << shell_quote(verilog_file)
+-        << " -o " << shell_quote(spice_file)
+-        << " -s " << shell_quote(cdl)
+-        << " > " << shell_quote(join_path(work_dir, "v2lvs.log")) << " 2>&1";
++    cmd << "cd " << shell_quote(work_dir);
++    if (open_converter) {
++        cmd << " && python3 " << shell_quote(alternative)
++            << " --verilog " << shell_quote(verilog_file)
++            << " --out " << shell_quote(spice_file)
++            << " --cdl " << shell_quote(cdl);
++    } else {
++        cmd << " && v2lvs -v " << shell_quote(verilog_file)
++            << " -o " << shell_quote(spice_file)
++            << " -s " << shell_quote(cdl);
++    }
++    cmd << " > " << shell_quote(join_path(work_dir, "v2lvs.log")) << " 2>&1";
+     LOGI << "Running v2lvs (OpenROAD path): " << cmd.str();
+     const int rc = std::system(cmd.str().c_str());
+     if (rc != 0) {
+diff --git a/src/yosys_manager.cpp b/src/yosys_manager.cpp
+index a57c106..092d33c 100644
+--- a/src/yosys_manager.cpp
++++ b/src/yosys_manager.cpp
+@@ -15,13 +15,9 @@
+ 
+ namespace {
+ 
+-// The four selectable physical delay stages must fit between opposite clock
+-// edges.  The longest TT routed chain is about 0.93 ns; a 2.5 ns cycle leaves
+-// 0.32 ns beyond that half-cycle delay for explicit uncertainty, interface
+-// budget, and route variation.  This replaces the impossible former 200 ps
+-// cycle and is a conservative implementation target, not a characterized
+-// macro frequency claim.
+-constexpr double kClockPeriodNs = 2.500;
++// The SIMD storage domain is fixed at 500 MHz. Keep failed timing evidence
++// at this 2ns target rather than relaxing the macro clock.
++constexpr double kClockPeriodNs = 2.000;
+ constexpr double kClockUncertaintyNs = 0.050;
+ constexpr double kIoDelayNs = 0.100;
+ constexpr double kInputMinDelayNs = 0.020;

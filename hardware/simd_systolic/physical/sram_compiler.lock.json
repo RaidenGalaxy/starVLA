@@ -1,0 +1,37 @@
+{
+  "schema_version": 1,
+  "repository": "https://github.com/shao-chien-lu/OpenFinRAM.git",
+  "commit": "751afff49d7f6ea6071c366732fbbe80c5f4c2e6",
+  "submodules": {
+    "third_party/argparse": "d924b84eba1f0f0adf38b20b7b4829f6f65b6570",
+    "third_party/gdstk": "a72404f06332e64fe5bfe4085d37c9d30a6abcbf",
+    "third_party/gdstk/external/qhull": "613debeaea72ee66626dace9ba1a2eff11b5d37d",
+    "third_party/googletest": "b796f7d44681514f58a683a3a71ff17c94edb0c1",
+    "third_party/plog": "2ab53dc768507fae46a30426e82e8018d093416b"
+  },
+  "patch": "physical/openfinram_500mhz.patch",
+  "patch_sha256": "395894300a846c56265e947452c4f705599d51b20c5886881b7a95f3f02c5cd4",
+  "patched_files_sha256": {
+    "include/main_config_helpers.hpp": "dc476eb899622cee8fc41830764ef3722c0b20bf043f2afeb43797cf31f892c5",
+    "src/main_config_helpers.cpp": "c43e47e0f249912234d1e34008106bbd6e3987b10a493feec717ab0e7f07bc17",
+    "src/openroad_manager.cpp": "a45f280136ceb1f2d399c4b672cd59db6a03a025853716d37afe7d237ecf836e",
+    "src/openroad_tcl_generator.cpp": "9344b27f2ef7120ae06ff819ea1754090fed001af47b373c3490e57c73697805",
+    "src/yosys_manager.cpp": "33790c7e9dc55f99012f3fc7c3005ab0413d29500992640e25ae4e928ce6d7a8"
+  },
+  "klayout": {
+    "version": "0.30.12",
+    "wheel": "klayout-0.30.12-cp312-cp312-manylinux_2_27_x86_64.manylinux_2_28_x86_64.whl",
+    "sha256": "b435290690ac904cfbe90295f701f5cacd8dc01f3f62ed574bb2c2e76f6a65ba"
+  },
+  "configuration": {
+    "num_wls": 128,
+    "num_data_bits": 64,
+    "num_banks": 1,
+    "num_rows_per_mux": 4,
+    "logical_depth": 1024,
+    "logical_width": 64,
+    "memory_period_ps": 2000
+  },
+  "physical_certified": false,
+  "converter_sha256": "bec194a512743912e4c20cbaa42ae1329a3fe37cc1e9102ffde2ad600f7c5fff"
+}
