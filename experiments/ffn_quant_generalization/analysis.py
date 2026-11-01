@@ -6,6 +6,7 @@ import numpy as np
 from scipy.stats import rankdata
 
 from experiments.ffn_quant_compression.statistics import Bootstrap, adjust_holm, interval, spearman_curves
+from experiments.ffn_quant_rootcause.interventions import Intervention
 from experiments.infinitevl_quant.progress import json_digest
 
 from .config import DATASETS, MODELS, POLICIES, SEEDS
@@ -61,7 +62,7 @@ def analyze(config, audit, splits, design, partial=False):
                         raise RuntimeError("row mask metadata differs from locked design")
                     expected_unit = json_digest(
                         {
-                            "spec": model["conditions"][label]["spec"],
+                            "spec": Intervention.from_payload(model["conditions"][label]["spec"]).payload(),
                             "input_digest": row["input_digest"],
                             "operation": "teacher",
                         }

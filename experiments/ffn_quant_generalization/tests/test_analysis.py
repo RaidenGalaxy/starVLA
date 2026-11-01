@@ -11,6 +11,8 @@ from experiments.ffn_quant_generalization.config import DATASETS, MODELS, Config
 from experiments.ffn_quant_generalization.design import build_design
 from experiments.ffn_quant_generalization.reporting import report
 from experiments.ffn_quant_generalization.runtime import progress
+from experiments.ffn_quant_rootcause.interventions import Intervention
+from experiments.infinitevl_quant.progress import atomic_json, json_digest
 
 
 @pytest.fixture
@@ -48,7 +50,11 @@ def synthetic_experiment(tmp_path):
                     store.commit(
                         f"{kind}__{split}__{label}",
                         sample.id,
-                        {"spec": record["spec"], "input_digest": sample.id, "operation": "teacher"},
+                        {
+                            "spec": Intervention.from_payload(record["spec"]).payload(),
+                            "input_digest": sample.id,
+                            "operation": "teacher",
+                        },
                         row,
                     )
         qa_store = progress(config, "qa", audit, design)
@@ -98,3 +104,31 @@ def test_analysis_rejects_missing_condition_instead_of_reporting_complete(synthe
         analyze(config, audit, splits, design)
     partial = analyze(config, audit, splits, design, partial=True)
     assert partial["partial"] and not partial["core_complete"]
+
+
+def test_runtime_unit_uses_integer_layers_after_json_roundtrip(synthetic_experiment):
+    config, audit, _splits, design = synthetic_experiment
+    model = design["models"]["infinitevl"]
+    label = model["aliases"]["sensitive_first"]["18"]
+    store = progress(config, "sweep", audit, design)
+    row = store.rows(f"infinitevl__screen32__{label}")[0]
+    raw_unit = {"spec": model["conditions"][label]["spec"], "input_digest": row["input_digest"], "operation": "teacher"}
+    runtime_unit = {**raw_unit, "spec": Intervention.from_payload(raw_unit["spec"]).payload()}
+    assert row["provenance"]["unit"] == json_digest(runtime_unit)
+    assert json_digest(runtime_unit) != json_digest(raw_unit)
+
+
+def test_analysis_still_rejects_binding_to_another_mask(synthetic_experiment):
+    config, audit, splits, design = synthetic_experiment
+    model = design["models"]["infinitevl"]
+    label = model["aliases"]["sensitive_first"]["18"]
+    store = progress(config, "sweep", audit, design)
+    path = store.sample_path(f"infinitevl__screen32__{label}", splits["screen32"][0].id)
+    row = json.loads(path.read_text())
+    row["provenance"]["unit"] = json_digest(
+        {"spec": Intervention(bits=4).payload(), "input_digest": row["input_digest"], "operation": "teacher"}
+    )
+    row["row_sha256"] = json_digest({k: v for k, v in row.items() if k != "row_sha256"})
+    atomic_json(path, row)
+    with pytest.raises(RuntimeError, match="different operation or mask"):
+        analyze(config, audit, splits, design)

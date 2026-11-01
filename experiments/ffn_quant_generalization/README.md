@@ -65,3 +65,10 @@ label mask. Original evidence and source are archived under
 `recovery/20261028_loss_reduction/`; migration records retain original checksums
 and explicitly reaggregate saved token losses under the corrected identity.
 The frozen layer order and persistent budget deadline remain unchanged.
+
+Analysis recovery (2026-11-01): persisted JSON encodes layer keys as strings,
+whereas runtime intervention fingerprints use integer keys. The analyzer now
+reconstructs `Intervention` before checking its fingerprint. All 11,104 core
+teacher records matched the original runtime encoding. The version migration
+under `recovery/20261101_analysis_identity/` archives all 18,310 records and
+preserves every loss, prediction, score, ranking, and the original deadline.
