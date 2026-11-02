@@ -65,6 +65,12 @@ def sha(path):return hashlib.sha256(Path(path).read_bytes()).hexdigest()
 
 
 def run(args):
+    if args.retimed_binary_conversion and(args.integer_conversion_onehot or args.registered_integer_prefixes or args.balanced_integer_select):
+        raise ValueError('retimed binary conversion is a separate conversion candidate')
+    if args.integer_product_pair and args.integer_fast_sum:
+        raise ValueError('carry-save product and separate fast-sum probes use different sum structures')
+    if args.integer_product_terms==4 and(not args.integer_product_pair or args.integer_product_kind!='booth'):
+        raise ValueError('four-term product cut requires the Booth product experiment')
     if args.registered_integer_prefixes and not args.integer_conversion_onehot:
         raise ValueError('registered integer prefixes require the onehot conversion experiment')
     if args.balanced_integer_select and not args.integer_conversion_onehot:
@@ -179,7 +185,62 @@ def run(args):
             if text.count(old)!=1:raise ValueError('unexpected F2 integer sum')
             text=text.replace(old,new)
         arithmetic.write_text(text)
+    if args.late_integer_mask:
+        arithmetic=work/'src/main/scala/simd/Arithmetic.scala';text=arithmetic.read_text()
+        old='val active=io.in.bits.fmt===f.U && io.in.bits.mask(lane)'
+        if text.count(old)!=1:raise ValueError('unexpected integer operand mask gate')
+        text=text.replace(old,'val active=io.in.bits.fmt===f.U // mask remains at the existing result/overflow selection')
+        arithmetic.write_text(text)
+    if args.integer_product_pair:
+        from signed_product_pair import SCALA as PAIR_SCALA
+        arithmetic=work/'src/main/scala/simd/Arithmetic.scala';text=arithmetic.read_text()
+        text=text.replace('class SimdAlu(',PAIR_SCALA+'\nclass SimdAlu(',1)
+        old='      val op=io.in.bits.op\n      val (prod,old,aa,bb,oo)='
+        if text.count(old)!=1:raise ValueError('unexpected integer product register declaration')
+        text=text.replace(old,'''      val op=io.in.bits.op
+      val partials=Module(new F2SignedProductPair(w,aw+1))
+      partials.io.a:=a.asUInt;partials.io.b:=b.asUInt
+      val pairLeft=RegEnable(partials.io.term0,ce)
+      val pairRight=RegEnable(partials.io.term1,ce)
+      val (prod,old,aa,bb,oo)=''')
+        old='      val multiply=if(cfg.stages==2)prod else RegEnable(prod,ce)'
+        if text.count(old)!=1:raise ValueError('unexpected integer multiply selection')
+        text=text.replace(old,'''      val oldWide=old.pad(aw+1).asUInt
+      val macSum=pairLeft^pairRight^oldWide
+      val macCarry=(((pairLeft&pairRight)|(pairLeft&oldWide)|(pairRight&oldWide))<<1)(aw,0)
+      val carryMac=FastCarry.add(macSum,macCarry,aw+1).asSInt
+      val multiply=if(cfg.stages==2)FastCarry.add(pairLeft,pairRight,aw+1).asSInt else RegEnable(prod,ce)''')
+        for old,new in [('prod.pad(aw+1)+old.pad(aw+1)','carryMac '),
+            ('aa.pad(aw+1)+bb.pad(aw+1)','FastCarry.add(aa.pad(aw+1).asUInt,bb.pad(aw+1).asUInt,aw+1).asSInt '),
+            ('aa.pad(aw+1)-bb.pad(aw+1)','FastCarry.add(aa.pad(aw+1).asUInt,~bb.pad(aw+1).asUInt,aw+1,true.B).asSInt ')]:
+            if text.count(old)!=1:raise ValueError('unexpected integer full-width arithmetic')
+            text=text.replace(old,new)
+        if args.integer_product_terms==4:
+            from carry_save_cut import transform as cut_transform
+            text=cut_transform(text)
+        arithmetic.write_text(text)
+    if args.retimed_binary_conversion:
+        from binary_conversion import transform as binary_transform
+        arithmetic=work/'src/main/scala/simd/Arithmetic.scala'
+        arithmetic.write_text(binary_transform(arithmetic.read_text()))
     controls=work/'rtl/ControlReplicas.sv';controls.write_text(controls.read_text()+RTL)
+    if args.local_enable:
+        from local_enable import RTL as ENABLE_RTL,transform as enable_transform
+        arithmetic=work/'src/main/scala/simd/Arithmetic.scala'
+        arithmetic.write_text(enable_transform(arithmetic.read_text()))
+        controls.write_text(controls.read_text()+ENABLE_RTL)
+    if args.local_fp_opcode:
+        from local_opcode import RTL as OPCODE_RTL,transform as opcode_transform
+        arithmetic=work/'src/main/scala/simd/Arithmetic.scala'
+        arithmetic.write_text(opcode_transform(arithmetic.read_text()))
+        controls.write_text(controls.read_text()+OPCODE_RTL)
+    if args.integer_product_pair:
+        from signed_product_pair import RTL as PAIR_RTL,baugh_rtl
+        if args.integer_product_kind=='baugh':PAIR_RTL=baugh_rtl()
+        if args.integer_product_terms==4:
+            from carry_save_cut import rtl as cut_rtl
+            PAIR_RTL=cut_rtl()
+        controls.write_text(controls.read_text()+PAIR_RTL)
     if args.balanced_integer_select:
         for width in(32,48,80,144):
             with controls.open('a')as stream:stream.write(f'''
@@ -245,6 +306,13 @@ endmodule
     report['registered_integer_prefixes']=args.registered_integer_prefixes
     report['integer_fast_sum']=args.integer_fast_sum
     report['balanced_integer_select']=args.balanced_integer_select
+    report['late_integer_mask']=args.late_integer_mask
+    report['integer_product_pair']=args.integer_product_pair
+    report['integer_product_kind']=args.integer_product_kind if args.integer_product_pair else None
+    report['integer_product_terms']=args.integer_product_terms if args.integer_product_pair else None
+    report['local_enable']=args.local_enable
+    report['local_fp_opcode']=args.local_fp_opcode
+    report['retimed_binary_conversion']=args.retimed_binary_conversion
     report['physical_target']=args.physical_target
     def save():(out/'verification.json').write_text(json.dumps(report,indent=2)+'\n')
     def call(name,command,cwd=work):
@@ -270,20 +338,27 @@ opt_clean
 sat -prove equivalent 1 -verify
 ''')
     call('context_equivalence',['yosys','-Q','-T','-s',proof])
+    if args.integer_product_pair:
+        call('signed_product_equivalence',[sys.executable,ROOT/'physical/check_signed_pair.py',
+            '--rtl',controls,'--out',out/'signed_product_proof','--primitive',
+            'SimdF2SignedBaughPair'if args.integer_product_kind=='baugh'else'SimdF2SignedBoothPair',
+            '--terms',str(args.integer_product_terms)])
     for kind in ('alu','pe'):
         call('build_'+kind,[sys.executable,'scripts/build.py','--kind',kind,'--stages','2','--rows','1',
             '--label','ctx_word','-j',str(args.jobs),*(['--hierarchical']if kind=='pe'else[])])
     alu=work/'.build/alu_2_1x1_ctx_word';pe=work/'.build/pe_2_1x1_ctx_word'
     call('alu_all_formats',[sys.executable,'scripts/check_alu.py','--build-dir',alu,'--exhaustive','--stall','--idle-gaps'])
-    if args.integer_conversion_onehot:
+    if args.integer_conversion_onehot or args.retimed_binary_conversion:
         call('conversion_rounding_sweep',[sys.executable,ROOT/'physical/check_integer_conversion.py',
             '--build-dir',alu,'--out',out/'rounding_sweep'])
     for name in ('check_pe','check_pe_state','check_ii'):
         call(name,[sys.executable,'scripts/'+name+'.py','--build-dir',pe])
     report['functional_passed']=True;save()
+    if args.functional_only:return
     target=args.physical_target
     call('physical_cts',[sys.executable,'physical/run.py','--target',target,'--stages','2','--rows','1',
-        '--period','1','--label','ctx_word','--rtl-build',pe if target=='pe'else alu,'--mapping-profile','fast','--cts-only'])
+        '--period','1','--label','ctx_word','--rtl-build',pe if target=='pe'else alu,'--mapping-profile','fast','--cts-only',
+        *(['--scalarize-tool-input']if args.integer_product_pair else[])])
     timing=work/f'.build/physical/asap7_TT_{target}_2_1x1_1ns_ctx_word/cts_timing.json'
     report['timing']=dict(path=str(timing),sha256=sha(timing),data=json.loads(timing.read_text()));save()
 
@@ -297,5 +372,13 @@ if __name__=='__main__':
     p.add_argument('--registered-integer-prefixes',action='store_true',help='capture balanced prefix trees at the existing first-stage boundary')
     p.add_argument('--integer-fast-sum',action='store_true',help='balanced exact integer add/sub/MAC carry trees inside the unchanged second stage')
     p.add_argument('--balanced-integer-select',action='store_true',help='preserve a logarithmic conversion result tree without adding registers')
+    p.add_argument('--late-integer-mask',action='store_true',help='retain result/overflow masks and remove the redundant multiplier-input mask; no register added')
+    p.add_argument('--integer-product-pair',action='store_true',help='capture signed Booth carry-save terms at the existing first-stage cut and finish MUL/MAC in stage2')
+    p.add_argument('--integer-product-kind',choices=['booth','baugh'],default='booth')
+    p.add_argument('--integer-product-terms',type=int,choices=[2,4],default=2)
+    p.add_argument('--local-enable',action='store_true',help='replicate existing F2 valid state beside register banks; no arithmetic stage added')
+    p.add_argument('--local-fp-opcode',action='store_true',help='preserve local exact FP opcode normalization, including defaultMAC aliases; no register added')
+    p.add_argument('--retimed-binary-conversion',action='store_true',help='prepare binary shift/exponent controls and sticky prefixes at the existing first cut')
     p.add_argument('--physical-target',choices=['pe','int64'],default='pe')
+    p.add_argument('--functional-only',action='store_true',help='save complete functional results before separate physical diagnostics')
     run(p.parse_args())

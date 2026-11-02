@@ -1,0 +1,22 @@
+{
+  "xyce": {
+    "repository": "https://github.com/Xyce/Xyce.git",
+    "commit": "e5b7b9bb5b221630c66654c059fc2d33524f5b21",
+    "sparse_patterns": ["/*", "!/doc/", "!/utils/ADMS/examples/"]
+  },
+  "trilinos": {
+    "repository": "https://github.com/trilinos/Trilinos.git",
+    "commit": "975307431d60d0859ebaa27c9169cbb1d4287513",
+    "version": "14.4.0",
+    "checkout_strategy": "package_batches",
+    "source_extra_directories": ["commonTools", "packages/belos/doc"],
+    "source_packages": ["amesos", "amesos2", "aztecoo", "belos", "common", "epetra", "epetraext", "ifpack", "kokkos", "kokkoskernels", "nox", "rol", "sacado", "shylu", "stokhos", "teuchos", "tpetra", "trilinoscouplings", "triutils", "zoltan", "zoltan2", "rtop", "thyra", "galeri"],
+    "sparse_patterns": ["/*", "!/doc/", "!/demos/", "!/packages/**/test/", "!/packages/**/tests/", "!/packages/**/example/", "!/packages/**/examples/", "!/packages/**/doc/"]
+  },
+  "suitesparse": {
+    "repository": "https://github.com/DrTimothyAldenDavis/SuiteSparse.git",
+    "commit": "d3c4926d2c47fd6ae558e898bfc072ade210a2a1",
+    "version": "7.8.3",
+    "sparse_patterns": ["/*", "!/*/", "/AMD/", "/SuiteSparse_config/", "/SuiteSparse_cmake/"]
+  }
+}

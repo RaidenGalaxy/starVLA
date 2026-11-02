@@ -24,8 +24,14 @@ proc simd_connect_system_supplies {} {
  global_connect
  simd_connect_protected_supplies
 }
-if {[info exists ::env(SIMD_RESUME_CTS)]} {
- read_db $::env(SIMD_OUT)/post_cts.odb
+if {[info exists ::env(SIMD_RESUME_CTS)] || [info exists ::env(SIMD_RESUME_INITIAL_HOLD)] || [info exists ::env(SIMD_RESUME_GLOBAL_ROUTE)] || [info exists ::env(SIMD_RESUME_DETAILED_ROUTE)]} {
+ if {[info exists ::env(SIMD_RESUME_DETAILED_ROUTE)]} {
+  read_db $::env(SIMD_OUT)/post_detailed_route.odb
+ } elseif {[info exists ::env(SIMD_RESUME_GLOBAL_ROUTE)]} {
+  read_db $::env(SIMD_OUT)/post_global_route.odb
+ } elseif {[info exists ::env(SIMD_RESUME_INITIAL_HOLD)]} {
+  read_db $::env(SIMD_OUT)/post_initial_hold.odb
+ } else {read_db $::env(SIMD_OUT)/post_cts.odb}
  read_sdc $::env(SIMD_SDC)
 source $::env(SIMD_SET_RC)
  set_wire_rc -signal -layer M3
@@ -39,8 +45,8 @@ source $::env(SIMD_SET_RC)
 initialize_floorplan -utilization 30 -aspect_ratio 1 -core_space 3 \
     -site asap7sc7p5t
 if {[info exists ::env(SIMD_FENCE_SCRIPT)]} {source $::env(SIMD_FENCE_SCRIPT)}
-repair_tie_fanout -separation 0 TIELOx1_ASAP7_75t_R/L
-repair_tie_fanout -separation 0 TIEHIx1_ASAP7_75t_R/H
+source $::env(SIMD_PROTECTED_TIES)
+simd_repair_protected_ties
 source $::env(SIMD_TRACKS)
 if {[info exists ::env(SIMD_SYSTEM)]} {source $::env(SIMD_MACRO_FLOORPLAN)}
 set_wire_rc -signal -layer M3
@@ -68,14 +74,15 @@ detailed_placement
 estimate_parasitics -placement
 repair_design -cap_margin 20 -slew_margin 20
 detailed_placement
+source $::env(SIMD_PROTECTED_CLOCKS)
 if {[info exists ::env(SIMD_CTS_CLUSTER_SIZE)]} {
- clock_tree_synthesis -root_buf $::env(SIMD_CTS_ROOT) -buf_list $::env(SIMD_CTS_BUFFERS) \
+ simd_protected_cts -root_buf $::env(SIMD_CTS_ROOT) -buf_list $::env(SIMD_CTS_BUFFERS) \
   -sink_clustering_enable -sink_clustering_size $::env(SIMD_CTS_CLUSTER_SIZE) \
   -sink_clustering_max_diameter $::env(SIMD_CTS_DIAMETER) -balance_levels
 } elseif {[info exists ::env(SIMD_CTS_ROOT)]} {
- clock_tree_synthesis -root_buf $::env(SIMD_CTS_ROOT) -buf_list $::env(SIMD_CTS_BUFFERS)
+ simd_protected_cts -root_buf $::env(SIMD_CTS_ROOT) -buf_list $::env(SIMD_CTS_BUFFERS)
 } else {
- clock_tree_synthesis -root_buf BUFx8_ASAP7_75t_R -buf_list {BUFx2_ASAP7_75t_R BUFx4_ASAP7_75t_R BUFx8_ASAP7_75t_R}
+ simd_protected_cts -root_buf BUFx8_ASAP7_75t_R -buf_list {BUFx2_ASAP7_75t_R BUFx4_ASAP7_75t_R BUFx8_ASAP7_75t_R}
 }
 }
 set_propagated_clock [all_clocks]
@@ -83,6 +90,7 @@ set setup_repair_margin 0.050
 if {[info exists ::env(SIMD_SETUP_MARGIN)]} {set setup_repair_margin $::env(SIMD_SETUP_MARGIN)}
 estimate_parasitics -placement
 simd_connect_system_supplies
+if {![info exists ::env(SIMD_RESUME_INITIAL_HOLD)] && ![info exists ::env(SIMD_RESUME_GLOBAL_ROUTE)] && ![info exists ::env(SIMD_RESUME_DETAILED_ROUTE)]} {
 write_db $::env(SIMD_OUT)/post_cts.odb
 report_checks -path_delay max -group_count 10 -format full_clock_expanded -digits 9 \
     > $::env(SIMD_OUT)/preopt_setup.rpt
@@ -106,6 +114,12 @@ repair_timing -hold -max_passes 12 -hold_margin 0.050 -max_buffer_percent 40 -ve
 detailed_placement
 simd_connect_system_supplies
 write_db $::env(SIMD_OUT)/post_initial_hold.odb
+} else {
+ if {[info exists ::env(SIMD_RESUME_DETAILED_ROUTE)]} {puts SIMD_RESUMED_DETAILED_ROUTE_CHECKPOINT} elseif {[info exists ::env(SIMD_RESUME_GLOBAL_ROUTE)]} {puts SIMD_RESUMED_GLOBAL_ROUTE_CHECKPOINT} else {puts SIMD_RESUMED_INITIAL_HOLD_CHECKPOINT}
+ report_clock_properties [all_clocks]
+}
+if {![info exists ::env(SIMD_RESUME_DETAILED_ROUTE)]} {
+if {![info exists ::env(SIMD_RESUME_GLOBAL_ROUTE)]} {
 global_route -guide_file $::env(SIMD_OUT)/route.guide -congestion_iterations 50
 estimate_parasitics -global_routing
 global_route -start_incremental
@@ -137,17 +151,32 @@ write_guides $::env(SIMD_OUT)/post_global_route.guide
 write_db $::env(SIMD_OUT)/post_global_route.odb
 report_checks -path_delay max -group_count 10 -format full_clock_expanded -digits 9 > $::env(SIMD_OUT)/post_global_route_setup.rpt
 report_checks -path_delay min -group_count 20 -format full_clock_expanded -digits 9 > $::env(SIMD_OUT)/post_global_route_hold.rpt
+} else {
+ read_guides $::env(SIMD_OUT)/post_global_route.guide
+}
 detailed_route -output_drc $::env(SIMD_OUT)/route.drc
+# Save routed geometry before the independently expensive RC extraction.
+# A bounded extraction timeout must not discard a completed detailed route.
+write_db $::env(SIMD_OUT)/post_detailed_route.odb.pending
+file rename -force $::env(SIMD_OUT)/post_detailed_route.odb.pending $::env(SIMD_OUT)/post_detailed_route.odb
+write_verilog $::env(SIMD_OUT)/post_detailed_route.v
+puts SIMD_DETAILED_ROUTE_CHECKPOINT_WRITTEN
+if {[info exists ::env(SIMD_DETAILED_ROUTE_ONLY)]} {exit}
+}
 if {[info exists ::env(SIMD_SYSTEM)]} {
  # Final checks include placed standard cells, synchronizers and CTS/ECO
  # buffers. The earlier floorplanning-only macro/grid probe is insufficient.
  check_power_grid -net VDD -error_file $::env(SIMD_OUT)/final_pdn_VDD.rpt
  check_power_grid -net VSS -error_file $::env(SIMD_OUT)/final_pdn_VSS.rpt
+ puts "SIMD_FINAL_POWER_GRID_VERIFIED"
 }
 define_process_corner -ext_model_index 0 X
 extract_parasitics -ext_model_file $::env(SIMD_RCX)
 write_spef $::env(SIMD_OUT)/design.spef
+puts SIMD_SPEF_READ_BEGIN
 read_spef $::env(SIMD_OUT)/design.spef
+report_parasitic_annotation -report_unannotated
+puts SIMD_SPEF_READ_END
 write_def $::env(SIMD_OUT)/design.def
 write_verilog $::env(SIMD_OUT)/routed.v
 write_db $::env(SIMD_OUT)/design.odb

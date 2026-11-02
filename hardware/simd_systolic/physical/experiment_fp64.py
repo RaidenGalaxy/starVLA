@@ -224,6 +224,34 @@ def split_operation_wrapper():
     return text
 
 
+def split_four_wrapper():
+    text='// SPDX-License-Identifier: Apache-2.0\n// Constant-operation paths share the same two arithmetic cuts.\n'
+    for width,format_name in((32,'FP32'),(64,'FP64')):
+        text+=f'''module SimdFpF2{width}(input logic clock,ce,input logic [{width-1}:0] a,b,c,
+input logic [2:0] op,output logic [{width-1}:0] result,output logic [4:0] flags);
+logic [1:0] choice_q;
+wire [{width-1}:0] data[4];
+fpnew_pkg::status_t status[4];
+always @(posedge clock)if(ce)begin
+ choice_q<=(op==0)?2'd0:(op==2)?2'd2:(op==3)?2'd3:2'd1;
+ result<=(data[0]&{{{width}{{choice_q==0}}}})|(data[1]&{{{width}{{choice_q==1}}}})|
+         (data[2]&{{{width}{{choice_q==2}}}})|(data[3]&{{{width}{{choice_q==3}}}});
+ flags<=(status[0]&{{5{{choice_q==0}}}})|(status[1]&{{5{{choice_q==1}}}})|
+        (status[2]&{{5{{choice_q==2}}}})|(status[3]&{{5{{choice_q==3}}}});
+end
+'''
+        for index,(operation,modifier)in enumerate((('MUL',0),('FMADD',0),('ADD',0),('ADD',1))):
+            text+=f'''SimdFpF2Core #(.FpFormat(fpnew_pkg::{format_name}),.NumPipeRegs(1),.PipeConfig(fpnew_pkg::INSIDE)) path{index}(
+ .clk_i(clock),.rst_ni(1'b1),.operands_i({{c,b,a}}),.is_boxed_i(3'b111),
+ .rnd_mode_i(fpnew_pkg::RNE),.op_i(fpnew_pkg::{operation}),.op_mod_i(1'b{modifier}),
+ .tag_i(1'b0),.mask_i(1'b1),.aux_i(1'b0),.in_valid_i(ce),.in_ready_o(),
+ .flush_i(1'b0),.result_o(data[{index}]),.status_o(status[{index}]),.extension_bit_o(),.tag_o(),.mask_o(),.aux_o(),
+ .out_valid_o(),.out_ready_i(ce),.busy_o(),.reg_ena_i(ce),.early_out_valid_o());
+'''
+        text+='endmodule\n'
+    return text
+
+
 def retime_before_sum(text):
     """Move the existing middle cut before addition; keep exactly one cut."""
     replacements=[
@@ -286,7 +314,15 @@ def run(args):
     shutil.copytree(inputs, out / 'inputs')
     core = out / 'inputs/SimdFpF2Core.sv'
     text = core.read_text()
-    if args.variant=='carry_save':
+    if args.variant in('parallel_exponents','effective_exponents'):
+        from parallel_exponents import RTL as EXPONENT_RTL,EFFECTIVE_RTL,transform,prove
+        effective=args.variant=='effective_exponents'
+        text=transform(text)
+        if effective:EXPONENT_RTL=EFFECTIVE_RTL
+        prefix=out/'inputs/PrefixAdd.sv';prefix.write_text(prefix.read_text()+EXPONENT_RTL)
+        shutil.copy2(ROOT/'physical/parallel_exponents.py',out/'parallel_exponent_driver.py')
+        prove(prefix,out/'exponent_equivalence',effective=effective)
+    elif args.variant=='carry_save':
         old = '  assign raw_product = raw_mantissa_a * raw_mantissa_b;'
         if text.count(old) != 1:
             raise ValueError('unexpected parent multiplier')
@@ -294,6 +330,73 @@ def run(args):
             '    .a(raw_mantissa_a),.b(raw_mantissa_b),.result(raw_product));')
         prefix = out / 'inputs/PrefixAdd.sv'
         prefix.write_text(prefix.read_text() + COMPRESSOR)
+    elif args.variant=='chunked_cut8':
+        from registered_chunk_sum import RTL as CHUNK_RTL,retime
+        text=retime(text)
+        prefix=out/'inputs/PrefixAdd.sv';prefix.write_text(prefix.read_text()+CHUNK_RTL)
+        primitive=out/'registered_chunk.sv';primitive.write_text(CHUNK_RTL)
+        with(out/'chunk_formal.log').open('w')as stream:
+            subprocess.run([sys.executable,str(ROOT/'physical/check_registered_chunk_sum.py'),
+                '--rtl',str(primitive),'--out',str(out/'chunk_formal')],check=True,stdout=stream,stderr=subprocess.STDOUT)
+    elif args.variant=='compact_exponent':
+        replacements=[
+            ('  localparam int NORM_CW=EXP_WIDTH+PRECISION_BITS+3;',
+             '  localparam int NORM_JW=$clog2(NORM_W);\n  localparam int NORM_CW=NORM_JW+PRECISION_BITS+3;'),
+            ('      localparam logic signed [EXP_WIDTH-1:0] OFFSET=j;\n'
+             '      wire signed [EXP_WIDTH-1:0] e=exponent_product_q+OFFSET;',
+             '      localparam logic [NORM_JW-1:0] OFFSET=j;'),
+            ('      assign norm_choice[j]=leading && (e>0);',
+             '      assign norm_choice[j]=leading;'),
+            ('{e,mant,sticky_top,sticky_rest}&{NORM_CW{norm_choice[j]}}',
+             '{OFFSET,mant,sticky_top,sticky_rest}&{NORM_CW{norm_choice[j]}}'),
+            ('  // The first stage captures the minimum-exponent alignment independently.',
+             '''  // Encode the selected leading position once, then add its exponent.
+  // The original first-stage anchor no longer drives163 parallel adders.
+  wire [NORM_JW-1:0] norm_index;
+  wire [PRECISION_BITS+2:0] normal_data;
+  assign {norm_index,normal_data}=norm_tree[1];
+  wire [EXP_WIDTH:0] normal_exp_sum;
+  SimdPrefixAdd #(.W(EXP_WIDTH)) normal_exponent_adder(
+    .a(exponent_product_q),.b({{(EXP_WIDTH-NORM_JW){1'b0}},norm_index}),
+    .cin(1'b0),.result(normal_exp_sum));
+  wire signed [EXP_WIDTH-1:0] normal_exponent=normal_exp_sum[EXP_WIDTH-1:0];
+  // The first stage captures the minimum-exponent alignment independently.'''),
+            ('    if(|norm_choice) begin\n'
+             '      {final_exponent,final_mantissa,sum_sticky_bits[2*PRECISION_BITS+2],sum_sticky_bits[0]}=norm_tree[1];',
+             '    if((|norm_choice) && normal_exponent>0) begin\n'
+             '      final_exponent=normal_exponent;\n'
+             '      {final_mantissa,sum_sticky_bits[2*PRECISION_BITS+2],sum_sticky_bits[0]}=normal_data;')]
+        for old,new in replacements:
+            if text.count(old)!=1:raise ValueError('unexpected onehot exponent selector: '+old)
+            text=text.replace(old,new)
+    elif args.variant=='split_four':
+        (out/'inputs/SimdFpF2.sv').write_text(split_four_wrapper())
+    elif args.variant=='predecoded_chunk':
+        from registered_chunk_sum import RTL as CHUNK_RTL,predecoded_rtl
+        prefix=out/'inputs/PrefixAdd.sv';raw=prefix.read_text();new=predecoded_rtl()
+        if raw.count(CHUNK_RTL)!=1:raise ValueError('expected a registered chunk parent')
+        prefix.write_text(raw.replace(CHUNK_RTL,new))
+        primitive=out/'registered_chunk.sv';primitive.write_text(new)
+        with(out/'chunk_formal.log').open('w')as stream:
+            subprocess.run([sys.executable,str(ROOT/'physical/check_registered_chunk_sum.py'),
+                '--rtl',str(primitive),'--out',str(out/'chunk_formal'),'--prefix-outputs'],
+                check=True,stdout=stream,stderr=subprocess.STDOUT)
+        replacements=[
+            ('  //Mantissa adder (ab+c). In normal addition, it cannot overflow.',
+             '  wire [3*PRECISION_BITS+3:0] leading_pos,leading_neg,lower_pos,lower_neg;\n'
+             '  //Mantissa adder (ab+c). In normal addition, it cannot overflow.'),
+            ('.bias({1\'b0,inject_carry_in}),.result(sum_pos));',
+             '.bias({1\'b0,inject_carry_in}),.result(sum_pos),.leading(leading_pos),.lower(lower_pos));'),
+            ('.bias(2\'d2),.result(negative_full));',
+             '.bias(2\'d2),.result(negative_full),.leading(leading_neg),.lower(lower_neg));'),
+            ('      wire leading;\n      if(j==NORM_W-1) assign leading=branch_sum[j];\n'
+             '      else assign leading=branch_sum[j] && !(|branch_sum[NORM_W-1:j+1]);',
+             '      wire leading=sign_candidate ? leading_neg[j] : leading_pos[j];'),
+            ('assign sticky_rest=|branch_sum[j-PRECISION_BITS-2:0];',
+             'assign sticky_rest=sign_candidate ? lower_neg[j-PRECISION_BITS-2] : lower_pos[j-PRECISION_BITS-2];')]
+        for old,new in replacements:
+            if text.count(old)!=1:raise ValueError('unexpected chunked speculative parent: '+old)
+            text=text.replace(old,new)
     elif args.variant=='zero_product':
         old='''  assign exponent_product = (info_a.is_zero || info_b.is_zero)
                             ? 2 - signed'(BIAS) // in case the product is zero, set minimum exp.
@@ -390,6 +493,56 @@ def run(args):
             if text.count(old)!=1:raise ValueError('unexpected normalization tree: '+old)
             text=text.replace(old,new)
         prefix=out/'inputs/PrefixAdd.sv';prefix.write_text(prefix.read_text()+BALANCED_PREFIXES)
+    elif args.variant=='preinvert_cut':
+        replacements=[
+            ('  logic [0:NUM_MID_REGS][3*PRECISION_BITS+3:0] mid_pipe_product_q,mid_pipe_addend_q;',
+             '  logic [0:NUM_MID_REGS][3*PRECISION_BITS+3:0] mid_pipe_product_q,mid_pipe_addend_q,mid_pipe_positive_q;\n'
+             '  logic [0:NUM_MID_REGS] mid_pipe_carry_q;'),
+            ('  assign mid_pipe_addend_q[0] = addend_after_shift;',
+             '  assign mid_pipe_addend_q[0] = addend_after_shift;\n'
+             '  assign mid_pipe_positive_q[0] = addend_shifted;\n'
+             '  assign mid_pipe_carry_q[0] = inject_carry_in;'),
+            ("    `FFL(mid_pipe_addend_q[i+1],mid_pipe_addend_q[i],reg_ena,'0)",
+             "    `FFL(mid_pipe_addend_q[i+1],mid_pipe_addend_q[i],reg_ena,'0)\n"
+             "    `FFL(mid_pipe_positive_q[i+1],mid_pipe_positive_q[i],reg_ena,'0)\n"
+             "    `FFL(mid_pipe_carry_q[i+1],mid_pipe_carry_q[i],reg_ena,'0)"),
+            ('.b((effective_subtraction_q ? ~mid_pipe_addend_q[NUM_MID_REGS] : mid_pipe_addend_q[NUM_MID_REGS])), .cin((effective_subtraction_q & ~sticky_before_add_q))',
+             '.b(mid_pipe_positive_q[NUM_MID_REGS]), .cin(mid_pipe_carry_q[NUM_MID_REGS])')]
+        for old,new in replacements:
+            if text.count(old)!=1:raise ValueError('unexpected retimed addend cut: '+old)
+            text=text.replace(old,new)
+    elif args.variant in('speculative_finish','chunked_speculative'):
+        if 'mid_pipe_tent_sign_q'not in text or 'assign sum_q = sum;'not in text:
+            raise ValueError('expected a verified retimed parent with its tentative sign registered')
+        # Move the existing positive/negative choice after normalization and
+        # rounding. Both alternatives are combinational in the same stage.
+        for subtract in(0,1):
+            for carry in(0,1):
+                for tentative in(0,1):
+                    original=int(subtract and carry==tentative)if subtract else tentative
+                    assert original==(tentative ^ int(subtract and not carry))
+        begin=text.index('  // --------------\n  // Normalization')
+        end=text.index('  // ----------------\n  // Output Pipeline',begin)
+        body=text[begin:end]
+        body=re.sub(r'\bsum_q\b','branch_sum',body)
+        body=re.sub(r'\bfinal_sign_q\b','branch_sign',body)
+        text=text[:begin]+'''  wire [WIDTH-1:0] finish_data[2];
+  fpnew_pkg::status_t finish_status[2];
+  for(genvar sign_candidate=0;sign_candidate<2;sign_candidate++)begin:speculative_finish
+    wire [3*PRECISION_BITS+3:0] branch_sum=sign_candidate ?
+        sum_neg[3*PRECISION_BITS+3:0] : sum_pos[3*PRECISION_BITS+3:0];
+    wire branch_sign=mid_pipe_tent_sign_q[NUM_MID_REGS] ^ (sign_candidate==1);
+'''+body+'''
+    assign finish_data[sign_candidate]=result_d;
+    assign finish_status[sign_candidate]=status_d;
+  end
+  wire choose_negative=effective_subtraction_q && !sum_carry;
+  fp_t result_d;
+  fpnew_pkg::status_t status_d;
+  assign result_d=choose_negative ? finish_data[1] : finish_data[0];
+  assign status_d=choose_negative ? finish_status[1] : finish_status[0];
+
+'''+text[end:]
     elif args.variant=='split_add_prefix':
         old='  wire [NORM_W-1:0] norm_choice;'
         if text.count(old)!=1:raise ValueError('expected onehot normalization parent')
@@ -472,6 +625,11 @@ def run(args):
         product,_=fp_operation(a,b,0,Format.F64,Op(0));c=product^0x8000000000000000
         value,flags=fp_operation(a,b,c,Format.F64,Op(1))
         vectors.append(f'{a:x} {b:x} {c:x} 1 {value:x} {flags}\n')
+    for opcode in range(4,8):
+        for _ in range(args.default_op_count):
+            a,b,c=[rng.getrandbits(64)for _ in range(3)]
+            value,flags=fp_operation(a,b,c,Format.F64,Op(1))
+            vectors.append(f'{a:x} {b:x} {c:x} {opcode} {value:x} {flags}\n')
     trace = out / 'rtl_vectors.txt'
     trace.write_text(''.join(vectors))
     result = subprocess.run([str(out/'rtl_sim'), str(trace), '2', 'elastic'],
@@ -481,6 +639,7 @@ def run(args):
         simulator_sha256=sha(out/'rtl_sim'), testbench_sha256=sha(ROOT/'tests/scalar_gate.cpp'),
         reference_sha256=sha(ROOT/'python/simd_eval/reference.py'), pipeline_stages=2,
         main_design_changed=False, scope='FP64 only', physical_frequency_certified=False)
+    report['default_opcode_vectors']=4*args.default_op_count
     (out/'rtl_verification.json').write_text(json.dumps(report, indent=2)+'\n')
     print('RTL verified:', json.dumps(report), flush=True)
     env = os.environ.copy()
@@ -501,8 +660,9 @@ if __name__ == '__main__':
     p = argparse.ArgumentParser(description=__doc__)
     p.add_argument('--source', type=Path, required=True)
     p.add_argument('--count', type=int, default=1000, help='vectors per operation')
-    p.add_argument('--variant',choices=['carry_save','zero_product','prefix_pruned','onehot_norm','fused_sum','booth','split_add_prefix','retimed_sum','retimed_sum_v2','balanced_norm'],default='carry_save')
+    p.add_argument('--variant',choices=['carry_save','zero_product','prefix_pruned','onehot_norm','fused_sum','booth','split_add_prefix','retimed_sum','retimed_sum_v2','balanced_norm','preinvert_cut','speculative_finish','chunked_cut8','chunked_speculative','predecoded_chunk','split_four','compact_exponent','parallel_exponents','effective_exponents'],default='carry_save')
     p.add_argument('--cancellation-count',type=int,default=0)
+    p.add_argument('--default-op-count',type=int,default=0,help='additional MAC-reference vectors per default scalar opcode4..7')
     p.add_argument('--mapping-profile',choices=['fast','full'],default='fast')
     p.add_argument('-j','--jobs', type=int, default=8)
     run(p.parse_args())

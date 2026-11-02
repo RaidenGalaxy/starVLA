@@ -207,9 +207,21 @@ def check(out,stages,count,routed=False,jobs=4,hierarchical_array=False,sim_thre
     net=out/('routed.v'if routed else'synth.v')
     proof=json.loads((out/'timing.json').read_text())if routed else identity
     if digest(net)!=proof['netlist_sha256'if routed else'mapped_sha256']:raise ValueError('physical netlist identity changed')
-    subprocess.run(['verilator','--cc','--exe','--build','-j',str(jobs),'-Wno-fatal','--top-module','GateDut',
-      '--Mdir',str(out/'gate_obj'),str(cells),str(net),str(wrapper),str(ROOT/'tests/scalar_gate.cpp'),
-      '-o',str(out/'gate_sim')],check=True,stdout=subprocess.DEVNULL,stderr=subprocess.DEVNULL)
+    # Kept prefix/selection vectors can produce huge alias concatenations
+    # beyond Verilator's preprocessing limit. Split internal wire names only,
+    # as in the PE/array checks; mapped cells, ports and connectivity remain.
+    simulation_net=out/'gate_simulation_netlist.v';split_script=out/'gate_splitnets.ys'
+    split_script.write_text(f'read_liberty -lib {lib}\nread_verilog {net}\nhierarchy -check -top {identity["top"]}\nsplitnets\nwrite_verilog -noattr -noexpr {simulation_net}\n')
+    with(out/'gate_splitnets.log').open('w')as log:
+        subprocess.run(['yosys','-Q','-T','-s',str(split_script)],check=True,stdout=log,stderr=subprocess.STDOUT)
+    from format_mapped_verilog import wrap_assignments
+    wrapped_assignments=wrap_assignments(simulation_net)
+    build_path=out/'gate_build.log'
+    if build_path.exists():shutil.copy2(build_path,out/('gate_build_'+digest(build_path)[:12]+'.log'))
+    with build_path.open('w')as build_log:
+        subprocess.run(['verilator','--cc','--exe','--build','-j',str(jobs),'-Wno-fatal','--top-module','GateDut',
+          '--Mdir',str(out/'gate_obj'),str(cells),str(simulation_net),str(wrapper),str(ROOT/'tests/scalar_gate.cpp'),
+          '-o',str(out/'gate_sim')],check=True,stdout=build_log,stderr=subprocess.STDOUT)
     rng=random.Random(981);vectors=[]
     edges=[0,1,0x8000000000000000,0x7ff0000000000000,0xfff0000000000000,
            0x7ff8000000000001,0x7ff0000000000001,0xfffffffffffff,0x10000000000000,0x7fefffffffffffff]
@@ -224,6 +236,8 @@ def check(out,stages,count,routed=False,jobs=4,hierarchical_array=False,sim_thre
     report=json.loads(run.stdout);report['netlist_sha256']=hashlib.sha256(net.read_bytes()).hexdigest()
     report.update(scope='fp64',stages=stages,rtl_sha256=identity['rtl_sha256'],mapped_netlist_kind='routed'if routed else'synthesis',random_clock_enable=not free)
     report.update(liberty_sha256=digest(lib),simulator_sha256=digest(out/'gate_sim'),
+        simulation_netlist_sha256=digest(simulation_net),simulation_transform='Yosys splitnets and whitespace-only assignment wrapping',
+        wrapped_assignments=wrapped_assignments,formatting_driver_sha256=digest(ROOT/'physical/format_mapped_verilog.py'),
         trace_sha256=digest(vf),reference_sha256=digest(ROOT/'python/simd_eval/reference.py'),
         testbench_sha256=digest(ROOT/'tests/scalar_gate.cpp'),test_script_sha256=digest(__file__),
         zero_delay_gate_simulation=True,timing_validation='separate extracted STA required')

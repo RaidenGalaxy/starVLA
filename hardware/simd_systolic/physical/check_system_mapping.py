@@ -32,6 +32,8 @@ def check(directory, package_directory, output):
     net = directory/'synth.v'
     if sha(net) != identity['mapped_sha256']:
         raise ValueError('mapped netlist changed')
+    from async_mapping_policy import validate as validate_async
+    validate_async(directory,identity)
     for name,digest in identity['input_manifest'].items():
         if sha(directory/'inputs'/name) != digest:
             raise ValueError('mapped source changed: '+name)

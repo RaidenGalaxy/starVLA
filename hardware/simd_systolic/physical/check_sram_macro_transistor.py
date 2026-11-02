@@ -44,6 +44,9 @@ def run(args):
     if args.resistance_formulation=='voltage':
         from prepare_resistance_model import prepare_voltage_resistance
         tools=prepare_voltage_resistance()
+    elif args.resistance_formulation=='zero_sheet':
+        from prepare_zero_sheet_model import prepare_zero_sheet
+        tools=prepare_zero_sheet()
     else:tools=prepare()
     out=args.out.resolve()
     if out.exists():raise ValueError('preserve prior schematic experiment')
@@ -178,7 +181,7 @@ if __name__=='__main__':
         help='one real column isolates convergence/peripheral behavior; its reduced loading cannot certify the macro')
     p.add_argument('--solver-rshunt-ohm',type=float,
         help='explicit numerical shunt for convergence diagnosis only; not physical leakage or signoff evidence')
-    p.add_argument('--resistance-formulation',choices=['current','voltage'],default='current',
+    p.add_argument('--resistance-formulation',choices=['current','voltage','zero_sheet'],default='current',
         help='separate equivalent voltage-branch OSDI model; original model and all resistance values are retained')
     p.add_argument('--timeout',type=int,default=600);args=p.parse_args()
     if not 1<=args.timeout<=3600:p.error('timeout must be within 1..3600 seconds')

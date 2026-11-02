@@ -16,23 +16,53 @@ from simd_eval.reference import Format,Op,operate
 from run import sha
 
 
-def run(directory,count,mapped):
+def run(directory,count,mapped,routed=False):
     directory=directory.resolve();identity=json.loads((directory/'build_identity.json').read_text())
     if identity['scope']!='int64'or identity['stages']!=2:raise ValueError('requires the specialized F2 I64 component')
     paths=[directory/'inputs'/name for name in identity['input_manifest']]
     for path in paths:
         if sha(path)!=identity['input_manifest'][path.name]:raise ValueError('component input changed: '+path.name)
     if rtl_digest(paths,directory/'inputs/common_cells')!=identity['rtl_sha256']:raise ValueError('component RTL identity changed')
-    out=directory/('check_mapped'if mapped else'check_rtl');out.mkdir(exist_ok=False)
+    out=directory/('check_routed'if routed else'check_mapped'if mapped else'check_rtl');out.mkdir(exist_ok=False)
     shutil.copy2(__file__,out/'check_driver.py')
     bench=out/'int64_main.cpp';source=ROOT/'sim/alu_main.cpp';text=source.read_text()
     if text.count('d.io_in_bits_fmt=q.fmt;')!=1:raise ValueError('unexpected ALU harness')
     text=text.replace('VSimdAlu','VSimdInt64').replace('d.io_in_bits_fmt=q.fmt;','')
     bench.write_text(text);shutil.copy2(ROOT/'sim/coverage.hpp',out/'coverage.hpp')
-    if mapped:
-        net=directory/'synth.v';lib=Path(identity['liberty_file'])
-        if sha(net)!=identity['mapped_sha256']or sha(lib)!=identity['liberty_sha256']:
+    simulation_transform=None
+    simulation_formatter=None
+    if mapped or routed:
+        net=directory/('routed.v'if routed else'synth.v');lib=Path(identity['liberty_file'])
+        if sha(directory/'synth.v')!=identity['mapped_sha256']or sha(lib)!=identity['liberty_sha256']:
             raise ValueError('mapped component/library changed')
+        actual_netlist_sha256=sha(net)
+        if routed:
+            timing=json.loads((directory/'timing.json').read_text())
+            if timing['netlist_sha256']!=actual_netlist_sha256 or timing['rtl_sha256']!=identity['rtl_sha256']:
+                raise ValueError('routed numerical check differs from extracted timing implementation')
+            # Escaped scalar aliases such as foo[0] can collide with the
+            # corresponding vector bit in Verilator after OpenROAD export.
+            # Use the same wire-only split used by the PE/array gate checks.
+            simulation_net=out/'tool_input.v';script=out/'splitnets.ys'
+            script.write_text(f'read_liberty -lib {lib}\nread_verilog {net}\nhierarchy -check -top SimdInt64\nsplitnets\nwrite_verilog -noattr -noexpr {simulation_net}\n')
+            with(out/'splitnets.log').open('w')as log:
+                subprocess.run(['yosys','-Q','-T','-s',str(script)],check=True,stdout=log,stderr=subprocess.STDOUT)
+            net=simulation_net
+            simulation_transform='Yosys splitnets; wire representation only'
+        elif identity.get('tool_input_netlist_sha256'):
+            net=directory/'tool_input.v'
+            if sha(net)!=identity['tool_input_netlist_sha256']:raise ValueError('imported tool netlist changed')
+        else:
+            # Synthesis-only builds have not reached OpenSTA's import step.
+            # Yosys can emit bus assignments beyond Verilator's lexer limit;
+            # keep the original mapping and wrap a private simulation copy.
+            from format_mapped_verilog import wrap_assignments
+            simulation_net=out/'tool_input.v';shutil.copy2(net,simulation_net)
+            simulation_formatter=out/'netlist_formatter.py'
+            shutil.copy2(ROOT/'physical/format_mapped_verilog.py',simulation_formatter)
+            wrap_assignments(simulation_net,all_statements=True)
+            net=simulation_net
+            simulation_transform='whitespace only; identical non-whitespace token sequence'
         cells=out/'cells.v'
         subprocess.run(['yosys','-Q','-T','-p',f'read_liberty -ignore_miss_func {lib}; write_verilog {cells}'],check=True,stdout=subprocess.DEVNULL)
         inputs=[cells,net]
@@ -73,7 +103,11 @@ def run(directory,count,mapped):
     report=dict(passed=True,scope='specialized I64 component including conversion',pipeline_stages=2,
         arithmetic_cycles_without_stalls=2,random_seed=1264,checks=checks,rtl_sha256=identity['rtl_sha256'],
         parent_alu_rtl_sha256=identity['parent_alu_rtl_sha256'],mapped_netlist=mapped,
-        netlist_sha256=sha(directory/'synth.v')if mapped else None,
+        routed_netlist=routed,zero_delay_numerical_check=True,
+        netlist_sha256=actual_netlist_sha256 if mapped or routed else None,
+        simulated_netlist_sha256=sha(net)if mapped or routed else None,
+        simulation_transform=simulation_transform,
+        simulation_formatter_sha256=sha(simulation_formatter)if simulation_formatter else None,
         simulator_sha256=sha(out/'sim'),trace_sha256=sha(trace),
         reference_sha256=sha(ROOT/'python/simd_eval/reference.py'),driver_sha256=sha(__file__),
         parent_harness_sha256=sha(source),physical_frequency_certified=False)
@@ -82,5 +116,6 @@ def run(directory,count,mapped):
 
 if __name__=='__main__':
     p=argparse.ArgumentParser(description=__doc__);p.add_argument('directory',type=Path)
-    p.add_argument('--count',type=int,default=1000);p.add_argument('--mapped',action='store_true')
-    a=p.parse_args();run(a.directory,a.count,a.mapped)
+    p.add_argument('--count',type=int,default=1000)
+    group=p.add_mutually_exclusive_group();group.add_argument('--mapped',action='store_true');group.add_argument('--routed',action='store_true')
+    a=p.parse_args();run(a.directory,a.count,a.mapped,a.routed)

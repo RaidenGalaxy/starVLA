@@ -30,6 +30,8 @@ def run(args):
         raise ValueError('mapped architecture/corner differs')
     net=source/'synth.v'
     if sha(net)!=identity['mapped_sha256']:raise ValueError('mapped system netlist changed')
+    from async_mapping_policy import validate as validate_async
+    validate_async(source,identity)
     original=load_package(args.mapped_sram_package,ARCH);selected=load_package(args.sram_package,ARCH)
     if original['manifest_sha256']!=identity['sram_package_manifest_sha256']:
         raise ValueError('original mapped macro identity differs')

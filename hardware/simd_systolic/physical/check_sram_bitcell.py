@@ -96,6 +96,9 @@ def run(args):
     if args.resistance_formulation=='voltage':
         from prepare_resistance_model import prepare_voltage_resistance
         tools=prepare_voltage_resistance()
+    elif args.resistance_formulation=='zero_sheet':
+        from prepare_zero_sheet_model import prepare_zero_sheet
+        tools=prepare_zero_sheet()
     else:tools=prepare()
     out=args.out.resolve()
     if out.exists():raise ValueError('preserve prior transistor diagnostics; choose a new --out')
@@ -166,6 +169,6 @@ def run(args):
 if __name__=='__main__':
     p=argparse.ArgumentParser(description=__doc__);p.add_argument('--sram-package',type=Path,required=True)
     p.add_argument('--out',type=Path,required=True)
-    p.add_argument('--resistance-formulation',choices=['current','voltage'],default='current')
+    p.add_argument('--resistance-formulation',choices=['current','voltage','zero_sheet'],default='current')
     p.add_argument('--use-klu',action='store_true')
     run(p.parse_args())

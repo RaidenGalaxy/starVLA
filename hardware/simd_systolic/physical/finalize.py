@@ -9,10 +9,14 @@ from pathlib import Path
 ROOT=Path(__file__).resolve().parents[1]
 sys.path.insert(0,str(Path(__file__).parent))
 from run import sha,tool,summarize
+DRIVER_SOURCE=Path(__file__).read_bytes()
 
 
 def finalize(out):
     out=out.resolve();identity=json.loads((out/'build_identity.json').read_text())
+    (out/'finalization_driver.py').write_bytes(DRIVER_SOURCE)
+    identity['finalization_driver_sha256']=sha(out/'finalization_driver.py')
+    (out/'build_identity.json').write_text(json.dumps(identity,indent=2)+'\n')
     env=os.environ.copy();local=ROOT/'.deps/tools/openroad'
     env['LD_LIBRARY_PATH']=str(local/'opt/or-tools/lib')+':'+str(local/'usr/lib/x86_64-linux-gnu')
     commands=(ROOT/'physical/run.tcl').read_text().split('puts "SIMD_FINAL_SETUP"')[1]
@@ -24,7 +28,10 @@ def finalize(out):
 {macro_library}set_cmd_units -time ns -capacitance fF
 read_db {out/'design.odb'}
 read_sdc {out/'design.sdc'}
+puts SIMD_SPEF_READ_BEGIN
 read_spef {out/'design.spef'}
+report_parasitic_annotation -report_unannotated
+puts SIMD_SPEF_READ_END
 set_propagated_clock [all_clocks]
 '''+commands)
     proc=subprocess.run([tool('openroad'),'-exit',str(tcl)],check=True,text=True,capture_output=True,env=env)

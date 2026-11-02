@@ -1,8 +1,9 @@
 #!/usr/bin/env python3
 """Reproducible synthesis and extracted timing; absent evidence never certifies a target."""
-import argparse,fcntl,hashlib,json,os,re,shutil,subprocess,sys
+import argparse,fcntl,hashlib,json,os,re,shutil,signal,subprocess,sys
 from pathlib import Path
 ROOT=Path(__file__).resolve().parents[1];sys.path.insert(0,str(ROOT/'scripts'))
+DRIVER_SOURCE=Path(__file__).read_bytes()
 sys.path.insert(0,str(ROOT/'python'))
 from simd_eval.constraints import core_policy, system_policy
 from simd_eval.architecture import ARCH, require_f2
@@ -111,15 +112,30 @@ def map_elaborated(out,lib,period,env,mapping_profile='full',sequential_profile=
     if not mapper or Path(mapper).resolve()==Path(tool('yosys')).resolve():
         raise RuntimeError('stable system Yosys mapper required (tested Ubuntu Yosys 0.33)')
     abc_lib,excluded=mapping_library(out,lib)
-    sequential_commands=''
+    from async_mapping_policy import qualify as qualify_async
+    async_metadata=qualify_async(out,lib)
+    sequential_commands=f'''dffunmap
+techmap -map {out/'Asap7AsyncFlops.v'}
+techmap
+select -assert-none t:$_DFFSR_* t:$_DFF_*0_ t:$_DFF_*1_ t:$_DFFE_*0?_ t:$_DFFE_*1?_
+'''
     sequential_metadata={'sequential_mapping_profile':sequential_profile}
     if sequential_profile!='standard':raise ValueError('only ASAP7 standard sequential mapping is supported')
     macro_lib=env.get('SIMD_MACRO_LIB',str(ROOT/'.deps/asap7_sram/generated/LIB/srambank_256x4x64_6t122.lib'))
+    abc_options='-fast 'if mapping_profile=='fast'else''
+    if mapping_profile=='choices':
+        # Combinational structural choices without the expensive full-flow
+        # fraiging/scorr/dc2 search. Registers never enter ABC (-dff is absent).
+        policy=out/'mapping_choices.abc'
+        policy.write_text(f'strash; &get -n; &dch -f; &nf -D {period*1000-150:g}; &put\n')
+        abc_options=f'-script {policy} '
+        sequential_metadata.update(abc_script_sha256=sha(policy),mapping_timeout_seconds=600)
+    elif mapping_profile not in('fast','full'):raise ValueError('unsupported ABC mapping profile')
     ys=out/'synth.ys';ys.write_text(f'''read_liberty -lib {lib}
 read_liberty -lib {macro_lib}
 read_rtlil {out/'premap_compat.il'}
 {sequential_commands}dfflibmap -liberty {lib}
-abc {'-fast 'if mapping_profile=='fast'else''}-liberty {abc_lib} -D {period*1000-150:g}
+abc {abc_options}-liberty {abc_lib} -D {period*1000-150:g}
 setundef -zero
 hilomap -singleton -hicell TIEHIx1_ASAP7_75t_R H -locell TIELOx1_ASAP7_75t_R L
 clean
@@ -129,7 +145,28 @@ tee -o {out/'cell_statistics.json'} stat -json -liberty {lib}
 write_verilog -noattr -noexpr {out/'synth.v'}
 ''')
     with(out/'synth.log').open('w')as log:
-        subprocess.run([mapper,'-Q','-T','-s',str(ys)],stdout=log,stderr=subprocess.STDOUT,check=True,env=env)
+        command=[mapper,'-Q','-T','-s',str(ys)]
+        if mapping_profile=='choices':
+            process=subprocess.Popen(command,stdout=log,stderr=subprocess.STDOUT,env=env,start_new_session=True)
+            try:code=process.wait(timeout=600)
+            except subprocess.TimeoutExpired:
+                # This group was created here and contains only this mapper
+                # and its ABC children. Never terminate unrelated tool jobs.
+                try:os.killpg(process.pid,signal.SIGTERM)
+                except ProcessLookupError:pass
+                try:process.wait(timeout=5)
+                except subprocess.TimeoutExpired:pass
+                # The parent can exit before a child handles SIGTERM.
+                # Terminate any remaining members of this same private group.
+                try:os.killpg(process.pid,signal.SIGKILL)
+                except ProcessLookupError:pass
+                process.wait()
+                (out/'mapping_failure.json').write_text(json.dumps(dict(
+                    status='bounded_mapping_timeout',timeout_seconds=600,
+                    script_sha256=sha(out/'mapping_choices.abc'),synthesis_script_sha256=sha(ys)))+'\n')
+                raise
+            if code:raise subprocess.CalledProcessError(code,command)
+        else:subprocess.run(command,stdout=log,stderr=subprocess.STDOUT,check=True,env=env)
     excluded_set=set(excluded)
     with(out/'synth.v').open()as mapped:
         for line in mapped:
@@ -137,7 +174,7 @@ write_verilog -noattr -noexpr {out/'synth.v'}
             if head and head[0]in excluded_set:
                 raise RuntimeError('mapping ignored dont-use cell policy: '+head[0])
     identity_path=out/'build_identity.json';identity=json.loads(identity_path.read_text())
-    identity.update(abc_library_sha256=sha(abc_lib),excluded_mapping_cells=excluded,mapping_profile=mapping_profile,**sequential_metadata)
+    identity.update(abc_library_sha256=sha(abc_lib),excluded_mapping_cells=excluded,mapping_profile=mapping_profile,**sequential_metadata,**async_metadata)
     identity_path.write_text(json.dumps(identity,indent=2)+'\n')
 
 def mapped_area_breakdown(standard_area, macro_count=0, macro_lef=None, macro_name=None):
@@ -156,6 +193,9 @@ def mapped_area_breakdown(standard_area, macro_count=0, macro_lef=None, macro_na
 
 
 def summarize(out,identity,period):
+    from async_mapping_policy import validate as validate_async
+    async_validation=validate_async(out,identity,out/'routed.v')
+    identity={**identity,'asynchronous_mapping_validation':async_validation}
     if identity['scope'] in ('system','gemm'):
         if sha(Path(identity['sram_liberty_file']))!=identity['sram_liberty_sha256']:
             raise ValueError('SRAM Liberty changed after implementation')
@@ -166,10 +206,39 @@ def summarize(out,identity,period):
         return float(m[1])
     setup,hold=slack('SIMD_FINAL_SETUP'),slack('SIMD_FINAL_HOLD')
     tns=float(re.search(r'SIMD_FINAL_TNS.*?tns\s+([-+\d.]+)',log,re.S)[1])
+    from parasitics import audit as audit_parasitics
+    driver_audit=out/'parasitic_driver_audit.json'
+    parasitics=audit_parasitics(log,out/'design.spef',driver_audit if driver_audit.exists()else None)
+    parasitics['spef_sha256']=sha(out/'design.spef')
+    (out/'parasitic_annotation.json').write_text(json.dumps(parasitics,indent=2)+'\n')
     areas=re.findall(r'Design area\s+([\d.]+)',log)
     evidence={name:str(out/file)for name,file in [('netlist','routed.v'),('sdc','design.sdc'),
       ('spef','design.spef'),('setup','setup.rpt'),('hold','hold.rpt'),('electrical','electrical.rpt'),
       ('coverage','coverage.rpt'),('drc','route.drc')]}
+    evidence['parasitic_annotation']=str(out/'parasitic_annotation.json')
+    if driver_audit.exists():evidence['parasitic_driver_audit']=str(driver_audit)
+    if identity.get('finalization_driver_sha256'):
+        path=out/'finalization_driver.py'
+        if sha(path)!=identity['finalization_driver_sha256']:raise ValueError('finalization driver snapshot changed')
+        evidence['finalization_driver']=str(path)
+    if identity.get('canonical_export_manifest_sha256'):
+        path=out/'canonical_export.json'
+        if sha(path)!=identity['canonical_export_manifest_sha256']:raise ValueError('canonical export manifest changed')
+        export=json.loads(path.read_text())
+        if not export['geometry_and_connectivity_preserved']:raise ValueError('canonical export geometry differs')
+        for filename,digest in export['evidence'].items():
+            if sha(filename)!=digest:raise ValueError('canonical export evidence changed: '+filename)
+        driver=out/'recovery_driver.py'
+        if sha(driver)!=identity['export_recovery_driver_sha256']:raise ValueError('export recovery driver changed')
+        evidence.update(canonical_export=str(path),export_recovery_driver=str(driver))
+    if identity.get('physical_driver_sha256'):
+        if sha(out/'physical_driver.py')!=identity['physical_driver_sha256']:
+            raise ValueError('executed physical driver snapshot changed')
+        evidence['physical_driver']=str(out/'physical_driver.py')
+    if identity.get('mapping_profile')=='choices':
+        if sha(out/'mapping_choices.abc')!=identity['abc_script_sha256']:
+            raise ValueError('ABC mapping policy snapshot changed')
+        evidence['abc_policy']=str(out/'mapping_choices.abc')
     for path in evidence.values():
         if not Path(path).exists():raise RuntimeError('missing signoff evidence: '+path)
     electrical=(out/'electrical.rpt').read_text();coverage=(out/'coverage.rpt').read_text()
@@ -208,12 +277,15 @@ def summarize(out,identity,period):
     evidence['constraint_analysis']=str(constraint_file)
     constraint_clean=not reset_waived and constraint_analysis['clean']
     macro_clean=identity['scope'] not in ('system','gemm') or (identity.get('sram_physical_certified',False) and identity.get('sram_corner_matched',False))
-    closed=period==ARCH['core_period_ps']/1000 and setup>=0 and hold>=0 and tns==0 and electrical_clean and coverage_clean and drc_clean and constraint_clean and macro_clean and identity.get('process')=='asap7' and identity.get('architecture_sha256')==ARCH['architecture_sha256'] and not identity.get('provenance_status','').startswith('historical')
+    power_clean='SIMD_FINAL_POWER_GRID_VERIFIED'in log
+    closed=parasitics['clean'] and period==ARCH['core_period_ps']/1000 and setup>=0 and hold>=0 and tns==0 and electrical_clean and coverage_clean and drc_clean and constraint_clean and macro_clean and power_clean and identity.get('process')=='asap7' and identity.get('architecture_sha256')==ARCH['architecture_sha256'] and not identity.get('provenance_status','').startswith('historical')
     scope=identity['scope'];rows=identity['rows']
     report={**identity,'period_ns':period,'setup_wns_ns':setup,'hold_wns_ns':hold,'tns_ns':tns,
       'timing_status':'array_closed'if closed and scope=='array'and rows==8 else'kernel_closed'if closed else'not_closed',
-      'setup_hold_closed':setup>=0 and hold>=0 and tns==0,
+      'setup_hold_closed':parasitics['clean'] and setup>=0 and hold>=0 and tns==0,
+      'parasitic_annotation_clean':parasitics['clean'],
       'electrical_clean':electrical_clean,'coverage_clean':coverage_clean,'route_drc_clean':drc_clean,
+      'power_grid_connectivity_verified':power_clean,
       'constraint_policy_clean':constraint_clean,'constraint_policy_version':2,'synchronous_reset_present':reset_present,'synchronous_reset_timed':not reset_waived,
       'constraint_limitations':['synchronous reset input was false-pathed']if reset_waived else[],
       'reference_process':'ASAP7 predictive 7nm RVT; research PDK' if identity.get('process')=='asap7' else 'historical process; inspect authenticated Liberty',
@@ -225,6 +297,8 @@ def summarize(out,identity,period):
 
 def run(args):
     target,stages,rows,period=args.target,args.stages,args.rows,args.period
+    if sum((args.resume_cts,args.resume_initial_hold,args.resume_global_route,args.resume_detailed_route))>1 or (args.cts_only and(args.resume_initial_hold or args.resume_global_route or args.resume_detailed_route)) or (args.detailed_route_only and(args.cts_only or args.resume_detailed_route)):
+        raise ValueError('choose one physical resume stage; post-CTS stages cannot be CTS-only')
     require_f2(stages)
     technology=profile(args.corner)
     if args.rtl_build and (args.map_from or args.reuse_mapped or args.remap_premap):
@@ -236,6 +310,12 @@ def run(args):
     label=('_'+args.label)if args.label else''
     out=ROOT/f'.build/physical/asap7_{args.corner}_{target}_{stages}_{rows}x{rows}_{period:g}ns{label}'
     out.mkdir(parents=True,exist_ok=True);guard=(out/'.lock').open('w');fcntl.flock(guard,fcntl.LOCK_EX|fcntl.LOCK_NB)
+    driver=out/'physical_driver.py'
+    if driver.exists()and driver.read_bytes()!=DRIVER_SOURCE:
+        history=out/('physical_driver_'+sha(driver)[:12]+'.py')
+        if history.exists()and history.read_bytes()!=driver.read_bytes():raise ValueError('physical driver archive collision')
+        if not history.exists():shutil.copy2(driver,history)
+    driver.write_bytes(DRIVER_SOURCE)
     macro_package=None
     if args.sram_package:
         if target not in('system','gemm'):raise ValueError('SRAM packages apply only to integrated targets')
@@ -264,7 +344,7 @@ def run(args):
         if(source/'generated/capabilities.json').exists():
             (out/'generated').mkdir(exist_ok=True)
             shutil.copy2(source/'generated/capabilities.json',out/'generated/capabilities.json')
-        for name in('cell_statistics.json','synth.log','mapping.lib','NangateSyncControls.v','sequential_mapping_proof.json'):
+        for name in('cell_statistics.json','synth.log','mapping.lib','Asap7AsyncFlops.v','NangateSyncControls.v','sequential_mapping_proof.json'):
             if(source/name).exists():shutil.copy2(source/name,out/name)
         identity['mapped_from']=str(source)
     elif args.reuse_mapped:
@@ -339,6 +419,8 @@ endmodule
         identity['mapped_sha256']=sha(out/'synth.v')
     if sha(out/'synth.v')!=identity['mapped_sha256']or sha(lib)!=identity['liberty_sha256']:
         raise RuntimeError('mapped netlist/library identity changed')
+    from async_mapping_policy import validate as validate_async
+    identity['asynchronous_mapping_validation']=validate_async(out,identity)
     package_digest=macro_package['manifest_sha256']if macro_package else None
     if (args.map_from or args.reuse_mapped or args.remap_premap)and identity.get('sram_package_manifest_sha256')!=package_digest:
         raise ValueError('mapped implementation has a different SRAM package identity')
@@ -351,6 +433,7 @@ endmodule
     if identity.get('abc_library_sha256')and sha(out/'mapping.lib')!=identity['abc_library_sha256']:
         raise RuntimeError('mapping library snapshot changed')
     identity.update(architecture_sha256=ARCH['architecture_sha256'],process='asap7',process_corner=args.corner,core_period_ps=ARCH['core_period_ps'],memory_period_ps=ARCH['memory_period_ps'],sram_physical_certified=macro_audit['physical_certified'] if target in ('system','gemm') else False)
+    identity['physical_driver_sha256']=hashlib.sha256(DRIVER_SOURCE).hexdigest()
     identity['analysis_period_ns']=period
     identity['liberty_file']=str(lib)
     if target in ('system','gemm'):
@@ -378,7 +461,7 @@ endmodule
         if not 0<=args.hold_margin<=.5:raise ValueError('hold repair margin must be in [0,0.5] ns')
         identity['routed_hold_repair_margin_ns']=args.hold_margin
     if args.clock_profile:
-        if args.resume_cts:raise ValueError('a resumed checkpoint retains its existing clock tree')
+        if args.resume_cts or args.resume_initial_hold or args.resume_global_route or args.resume_detailed_route:raise ValueError('a resumed checkpoint retains its existing clock tree')
         identity['clock_tree_options']=(dict(root=technology['cts_root'],buffers=technology['cts_buffers'],
           sink_clustering=True,cluster_size=64 if args.clock_profile=='clustered64'else 20,cluster_diameter_um=50)
           if args.clock_profile in('clustered','clustered64') else
@@ -509,10 +592,50 @@ set_load 3.898 [all_outputs]
         identity['mapped_constraint_generator_sha256']=sha(out/'mapped_system_constraints.py')
         identity_file.write_text(json.dumps(identity,indent=2)+'\n')
         identity['memory_macro_instances']=16
+    # Large carry-save buses can produce assignment/port lines beyond the
+    # OpenSTA Verilog lexer's buffer. Preserve the mapped netlist and import
+    # an authenticated whitespace-only copy; do not change connectivity.
+    from format_mapped_verilog import wrap_assignments
+    tool_net=out/'tool_input.v'
+    if args.resume_cts or args.resume_initial_hold or args.resume_global_route or args.resume_detailed_route:
+        checkpoint=json.loads((out/'cts_timing.json').read_text())
+        if checkpoint.get('tool_input_netlist_sha256'):
+            for key,name in [('tool_input_netlist_sha256','tool_input.v'),
+                    ('tool_input_formatter_sha256','netlist_formatter.py')]:
+                if sha(out/name)!=checkpoint[key]:raise ValueError('CTS import snapshot changed: '+name)
+                identity[key]=checkpoint[key]
+            identity['tool_input_transform']=checkpoint['tool_input_transform']
+            identity['tool_input_wrapped_lines']=checkpoint['tool_input_wrapped_lines']
+        else:tool_net=out/'synth.v'
+        identity['resumed_cts_report_sha256']=sha(out/'cts_timing.json')
+    elif args.scalarize_tool_input:
+        script=out/'scalarize_tool_input.ys'
+        script.write_text(f'read_liberty -lib {lib}\nread_verilog {out/"synth.v"}\nhierarchy -check -top {identity["top"]}\nsplitnets\nwrite_verilog -noattr -noexpr {tool_net}\n')
+        with(out/'scalarize_tool_input.log').open('w')as log:
+            subprocess.run([tool('yosys'),'-Q','-T','-s',str(script)],env=env,
+                stdout=log,stderr=subprocess.STDOUT,check=True)
+        identity['tool_input_scalarization_script_sha256']=sha(script)
+    else:shutil.copy2(out/'synth.v',tool_net)
+    if not(args.resume_cts or args.resume_initial_hold or args.resume_global_route or args.resume_detailed_route):
+        wrapped=wrap_assignments(tool_net,all_statements=True)
+        shutil.copy2(ROOT/'physical/format_mapped_verilog.py',out/'netlist_formatter.py')
+        identity.update(tool_input_netlist_sha256=sha(tool_net),
+            tool_input_formatter_sha256=sha(out/'netlist_formatter.py'),
+            tool_input_wrapped_lines=wrapped,
+            tool_input_transform=('Yosys splitnets; 'if args.scalarize_tool_input else'')+'whitespace only; identical non-whitespace token sequence')
+    identity_file.write_text(json.dumps(identity,indent=2)+'\n')
     env.update(SIMD_TECH_LEF=str(technology['tech_lef']),
       SIMD_CELL_LEF=str(technology['cell_lef']),SIMD_LIB=str(lib),
-      SIMD_NETLIST=str(out/'synth.v'),SIMD_TOP=identity['top'],SIMD_SDC=str(sdc),
+      SIMD_NETLIST=str(tool_net),SIMD_TOP=identity['top'],SIMD_SDC=str(sdc),
       SIMD_TRACKS=str(technology['tracks']),SIMD_RCX=str(technology['rcx']),SIMD_OUT=str(out))
+    shutil.copy2(ROOT/'physical/protected_ties.tcl',out/'protected_ties.tcl')
+    identity['protected_ties_sha256']=sha(out/'protected_ties.tcl')
+    identity_file.write_text(json.dumps(identity,indent=2)+'\n')
+    env['SIMD_PROTECTED_TIES']=str(out/'protected_ties.tcl')
+    shutil.copy2(ROOT/'physical/protected_clocks.tcl',out/'protected_clocks.tcl')
+    identity['protected_clocks_sha256']=sha(out/'protected_clocks.tcl')
+    identity_file.write_text(json.dumps(identity,indent=2)+'\n')
+    env['SIMD_PROTECTED_CLOCKS']=str(out/'protected_clocks.tcl')
     env.update(SIMD_CTS_ROOT=technology['cts_root'],SIMD_CTS_BUFFERS=' '.join(technology['cts_buffers']),SIMD_SET_RC=str(pdk/'setRC.tcl'))
     if target in ('system','gemm'):
         env['SIMD_SYSTEM']='1'
@@ -559,11 +682,31 @@ set_load 3.898 [all_outputs]
         identity['regional_seed_sha256']=sha(seed);identity_file.write_text(json.dumps(identity,indent=2)+'\n')
         env['SIMD_REGION_SEED_SCRIPT']=str(seed)
     if args.cts_only:env['SIMD_CTS_ONLY']='1'
+    if args.detailed_route_only:env['SIMD_DETAILED_ROUTE_ONLY']='1'
     if args.resume_cts:
         checkpoint=json.loads((out/'cts_timing.json').read_text())
         if checkpoint['mapped_sha256']!=identity['mapped_sha256']or checkpoint['checkpoint_sha256']!=sha(out/'post_cts.odb'):
             raise RuntimeError('CTS checkpoint is from a different mapped implementation')
         env['SIMD_RESUME_CTS']='1'
+    if args.resume_initial_hold or args.resume_global_route or args.resume_detailed_route:
+        checkpoint_path=out/'resume_checkpoint_manifest.json'
+        checkpoint=json.loads(checkpoint_path.read_text())
+        resume_stage='post_detailed_route'if args.resume_detailed_route else'post_global_route'if args.resume_global_route else'post_initial_hold'
+        if checkpoint['stage']!=resume_stage or checkpoint['rtl_sha256']!=identity['rtl_sha256'] or checkpoint['mapped_sha256']!=identity['mapped_sha256']:
+            raise ValueError('post-hold checkpoint implementation differs')
+        required=[('checkpoint_sha256',resume_stage+'.odb'),('sdc_sha256','design.sdc')]
+        if args.resume_global_route:required.append(('guides_sha256','post_global_route.guide'))
+        if args.resume_detailed_route:required.append(('routed_netlist_sha256','post_detailed_route.v'))
+        for key,name in required:
+            if sha(out/name)!=checkpoint[key]:raise ValueError('post-hold checkpoint changed: '+name)
+        parent=Path(checkpoint['parent_manifest'])
+        if sha(parent)!=checkpoint['parent_manifest_sha256']:raise ValueError('post-hold parent evidence changed')
+        for path,digest in json.loads(parent.read_text())['evidence'].items():
+            if sha(Path(path))!=digest:raise ValueError('post-hold parent input changed: '+path)
+        identity['resumed_stage']=resume_stage
+        identity['resumed_stage_manifest_sha256']=sha(checkpoint_path)
+        identity_file.write_text(json.dumps(identity,indent=2)+'\n')
+        env['SIMD_RESUME_DETAILED_ROUTE'if args.resume_detailed_route else'SIMD_RESUME_GLOBAL_ROUTE'if args.resume_global_route else'SIMD_RESUME_INITIAL_HOLD']='1'
     flow=out/'flow.tcl'
     if (out/'route.log').exists():
         attempt=len(list(out.glob('attempt_*_route.log')))+1
@@ -573,6 +716,19 @@ set_load 3.898 [all_outputs]
     try:
         with(out/'route.log').open('w')as log:
             subprocess.run([tool('openroad'),'-exit',str(flow)],stdout=log,stderr=subprocess.STDOUT,env=env,check=True)
+        if args.detailed_route_only:
+            log_text=(out/'route.log').read_text()
+            if 'SIMD_DETAILED_ROUTE_CHECKPOINT_WRITTEN'not in log_text:
+                raise RuntimeError('detailed route did not reach its atomic geometry checkpoint')
+            paths=[out/name for name in('post_detailed_route.odb','post_detailed_route.v',
+                'design.sdc','synth.v','build_identity.json','route.log','flow.tcl','physical_driver.py')]
+            paths += [out/'route_parent.json']if(out/'route_parent.json').exists()else[]
+            checkpoint=dict(stage='post_detailed_route',rtl_sha256=identity['rtl_sha256'],
+                mapped_sha256=identity['mapped_sha256'],arithmetic_stages=2,core_period_ns=period,
+                extracted_sta_complete=False,physical_frequency_certified=False,
+                evidence={str(path):sha(path)for path in paths})
+            (out/'detailed_route_checkpoint.json').write_text(json.dumps(checkpoint,indent=2)+'\n')
+            (out/'failure.json').unlink(missing_ok=True);print(json.dumps(checkpoint,indent=2));return
         if args.cts_only:
             text=(out/'route.log').read_text()
             def cts_slack(marker):return float(re.search(marker+r'.*?worst slack\s+([-+\d.]+)',text,re.S)[1])
@@ -590,6 +746,7 @@ set_load 3.898 [all_outputs]
 
 if __name__=='__main__':
     p=argparse.ArgumentParser();p.add_argument('--corner',choices=['TT','SS','FF'],default='TT')
+    p.add_argument('--scalarize-tool-input',action='store_true',help='split internal buses for the OpenSTA importer, retaining the original mapped netlist')
     p.add_argument('--allow-unverified-sram',action='store_true',help='exploratory system P&R only; cannot produce a physical acceptance certificate')
     p.add_argument('--sram-package',type=Path,help='authenticated generated research macro package; estimated timing cannot certify frequency')
     p.add_argument('--target',choices=['fp64','int64','alu','pe','array','system','gemm'],default='fp64')
@@ -597,11 +754,11 @@ if __name__=='__main__':
     p.add_argument('--period',type=float,default=1);p.add_argument('--label');p.add_argument('--reuse-mapped',action='store_true')
     p.add_argument('--pe-hierarchy',action='store_true')
     p.add_argument('--rtl-build',type=Path,help='synthesize the authenticated frozen RTL of an existing simulator without re-elaboration')
-    p.add_argument('--mapping-profile',choices=['full','fast'],help='ABC mapping search policy; area and timing always describe the actual resulting netlist')
+    p.add_argument('--mapping-profile',choices=['full','fast','choices'],help='ABC mapping search policy; choices bounds its isolated combinational search to600s')
     p.add_argument('--sequential-profile',choices=['standard'],help='ASAP7 standard sequential mapping')
     p.add_argument('--clock-profile',choices=['standard','clustered','clustered64'],help='record actual clock buffer and sink-clustering policy')
     p.add_argument('--hold-margin',type=float,help='routed hold-repair guard band in ns; acceptance uses strict extracted STA')
     p.add_argument('--setup-margin',type=float,help='setup-repair guard band in ns; does not change the SDC or acceptance period')
     p.add_argument('--placement-profile',choices=['timing','geometric','regional'],help='global placement optimization; final extracted STA is unchanged')
     p.add_argument('--placement-grid',type=int,help='bounded GPL grid, power of two from 32 to 2048; detailed placement and timing checks stay unchanged')
-    p.add_argument('--map-from',type=Path);p.add_argument('--synth-only',action='store_true');p.add_argument('--cts-only',action='store_true');p.add_argument('--resume-cts',action='store_true');p.add_argument('--remap-premap',action='store_true');p.add_argument('--free-running',action='store_true');run(p.parse_args())
+    p.add_argument('--map-from',type=Path);p.add_argument('--synth-only',action='store_true');p.add_argument('--cts-only',action='store_true');p.add_argument('--resume-cts',action='store_true');p.add_argument('--resume-initial-hold',action='store_true');p.add_argument('--resume-global-route',action='store_true');p.add_argument('--resume-detailed-route',action='store_true');p.add_argument('--detailed-route-only',action='store_true');p.add_argument('--remap-premap',action='store_true');p.add_argument('--free-running',action='store_true');run(p.parse_args())
